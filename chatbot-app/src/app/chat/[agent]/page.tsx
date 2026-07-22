@@ -257,18 +257,18 @@ export default function AgentChatPage() {
       );
 
       setIsStreaming(true);
-      streamingRef.current = true;
+      streamingRef.current = true; //preventing me to send another msg while waiting for response
 
       try {
-        const apiUrl = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
+        const apiUrl = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000"; //backend
 
-        // Build history from the conversation BEFORE adding the current message
+        // Build history from the conversation BEFORE adding the current message last 8 msgs
         const historyMessages = (activeConversation?.messages ?? [])
           .filter((m) => m.content.trim() && !m.isStreaming)
           .slice(-8)
           .map((m) => ({ role: m.role as "user" | "assistant", content: m.content }));
 
-        const res = await fetch(`${apiUrl}/chat/${agentId}`, {
+        const res = await fetch(`${apiUrl}/chat/${agentId}`, { //api call hit with msg and history
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ message: text, history: historyMessages }),

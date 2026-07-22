@@ -295,12 +295,9 @@ async def chat(agent_name: str, req: ChatRequest, request: Request):
     cached = get_cached_response(req.message)
     if cached:
         print(f"  [CACHE HIT] sim={cached['similarity']} | {cached['original_query'][:60]}")
-        return {
-            "response": cached["response"],
-            "source": "cache",
-            "cache_hit": True,
-            "similarity": cached["similarity"],
-        }
+        async def cached_stream():
+            yield cached["response"]
+        return StreamingResponse(cached_stream(), media_type="text/plain; charset=utf-8")
 
     # POSITION 3 — Redis session history (replaces req.history)
     session_turns = get_history(session_id)
