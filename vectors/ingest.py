@@ -48,6 +48,10 @@ CHUNK_TOKENS = 600
 OVERLAP_TOKENS = 75
 VECTOR_DIM = 384
 
+# When false, we ignore all images found in .docx files and index text-only.
+# This avoids saving image binaries and avoids the UI "__IMAGES__" protocol.
+KB_ENABLE_IMAGES = os.getenv("KB_ENABLE_IMAGES", "false").strip().lower() in {"1", "true", "yes", "y"}
+
 _tokenizer = AutoTokenizer.from_pretrained("sentence-transformers/all-MiniLM-L6-v2")
 
 
@@ -123,6 +127,7 @@ def extract_docx_rich(
     source: bytes | Path,
     source_prefix: str,
     images_dir: Path = STATIC_IMAGES_DIR,
+    extract_images: bool = KB_ENABLE_IMAGES,
 ) -> tuple[str, list[str]]:
     """
     Extract text from a .docx preserving step/bullet/table structure.
@@ -135,7 +140,8 @@ def extract_docx_rich(
     else:
         doc = DocxDocument(str(source))
 
-    images_dir.mkdir(parents=True, exist_ok=True)
+    if extract_images:
+        images_dir.mkdir(parents=True, exist_ok=True)
 
     lines: list[str] = []
     img_counter = 0
@@ -160,25 +166,26 @@ def extract_docx_rich(
         # ── Paragraph ────────────────────────────────────────────────────────
         para: DocxParagraph = block
 
-        # Extract inline images from this paragraph
-        for drawing in para._p.findall('.//' + _qn('w:drawing')):
-            blip = drawing.find('.//' + _qn('a:blip'))
-            if blip is None:
-                continue
-            rId = blip.get(_qn('r:embed'))
-            if not rId or rId not in doc.part.related_parts:
-                continue
-            img_part = doc.part.related_parts[rId]
-            ext = img_part.content_type.split('/')[-1].lower()
-            if ext == 'jpeg':
-                ext = 'jpg'
-            if ext not in {'png', 'jpg', 'gif', 'bmp', 'tiff', 'webp'}:
-                continue
-            img_counter += 1
-            img_id = f"{source_prefix}_{img_counter:03d}.{ext}"
-            (images_dir / img_id).write_bytes(img_part.blob)
-            saved_ids.append(img_id)
-            lines.append(f"[IMAGE:{img_id}]")
+        # Extract inline images from this paragraph (optional)
+        if extract_images:
+            for drawing in para._p.findall('.//' + _qn('w:drawing')):
+                blip = drawing.find('.//' + _qn('a:blip'))
+                if blip is None:
+                    continue
+                rId = blip.get(_qn('r:embed'))
+                if not rId or rId not in doc.part.related_parts:
+                    continue
+                img_part = doc.part.related_parts[rId]
+                ext = img_part.content_type.split('/')[-1].lower()
+                if ext == 'jpeg':
+                    ext = 'jpg'
+                if ext not in {'png', 'jpg', 'gif', 'bmp', 'tiff', 'webp'}:
+                    continue
+                img_counter += 1
+                img_id = f"{source_prefix}_{img_counter:03d}.{ext}"
+                (images_dir / img_id).write_bytes(img_part.blob)
+                saved_ids.append(img_id)
+                lines.append(f"[IMAGE:{img_id}]")
 
         text = para.text.strip()
         if not text:
@@ -356,7 +363,9 @@ def ingest_to_collection(
     full: bool = False,
 ) -> int:
     """Embed text and store in a named collection.
-    Automatically strips [IMAGE:id] markers from chunk text and stores ids in payload."""
+
+    If KB_ENABLE_IMAGES is false (default), we will not store any image IDs.
+    """
     raw_chunks = chunk_text(text)
     clean_chunks: list[str] = []
     payloads: list[dict] = []
@@ -367,7 +376,7 @@ def ingest_to_collection(
             "text": clean,
             "source": source_name,
             "chunk_index": i,
-            "image_ids": img_ids,
+            "image_ids": img_ids if KB_ENABLE_IMAGES else [],
         })
     _embed_and_upsert(clean_chunks, payloads, collection_name, full)
     return len(clean_chunks)
@@ -377,8 +386,9 @@ def run_ingestion_from_bytes(data: bytes, source_name: str, collection_name: str
     """Ingest from raw bytes (used by KB URL watcher). Uses rich extraction for .docx."""
     if source_name.lower().endswith(".docx"):
         slug = re.sub(r'[^a-z0-9]+', '_', Path(source_name).stem.lower()).strip('_')
-        text, img_ids = extract_docx_rich(data, slug)
-        print(f"✂️  Rich extraction: {len(img_ids)} images saved")
+        text, img_ids = extract_docx_rich(data, slug, extract_images=KB_ENABLE_IMAGES)
+        if KB_ENABLE_IMAGES:
+            print(f"✂️  Rich extraction: {len(img_ids)} images saved")
     else:
         text = extract_text_from_bytes(data, source_name)
     return ingest_to_collection(text, source_name, collection_name, full=full)
@@ -434,8 +444,9 @@ def ingest_agent(agent_name: str, full: bool = False) -> None:
         print(f"\n  📄 {f.name}")
         if f.suffix.lower() == ".docx":
             slug = re.sub(r'[^a-z0-9]+', '_', f.stem.lower()).strip('_')
-            text, img_ids = extract_docx_rich(f, slug)
-            print(f"     🖼️  {len(img_ids)} images extracted → static/images/")
+            text, img_ids = extract_docx_rich(f, slug, extract_images=KB_ENABLE_IMAGES)
+            if KB_ENABLE_IMAGES:
+                print(f"     🖼️  {len(img_ids)} images extracted → static/images/")
         else:
             text = extract_text_from_file(f)
 
@@ -449,7 +460,7 @@ def ingest_agent(agent_name: str, full: bool = False) -> None:
                 "text": clean,
                 "source": f.name,
                 "chunk_index": i,
-                "image_ids": chunk_imgs,
+                "image_ids": chunk_imgs if KB_ENABLE_IMAGES else [],
             })
 
     _embed_and_upsert(all_chunks, all_payloads, collection, full)

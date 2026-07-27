@@ -29,6 +29,42 @@ from ratelimit import is_rate_limited
 
 logger = logging.getLogger("kb_watcher")
 
+
+def _is_low_info_query(text: str) -> bool:
+    """Detect inputs that are too vague to retrieve reliably.
+
+    Example: users typing "break" or "flag" (often spreadsheet markers) can
+    otherwise retrieve arbitrary KB chunks and produce unrelated answers.
+    """
+    t = (text or "").strip().lower()
+    if not t:
+        return True
+
+    # If the user clearly asked a question, let it through.
+    if "?" in t:
+        return False
+
+    words = [w for w in t.split() if w]
+    if len(words) >= 3:
+        return False
+
+    # Allow common interrogative starts even if short (e.g. "how enroll")
+    interrogatives = {
+        "what", "how", "when", "where", "who", "why",
+        "can", "do", "does", "did",
+        "is", "are", "was", "were",
+        "should", "could", "would",
+    }
+    if words and words[0] in interrogatives:
+        return False
+
+    # Otherwise treat 1-2 word fragments as too ambiguous.
+    return True
+
+# When false, the backend will not emit the UI image protocol (__IMAGES__) even if
+# image_ids exist in Qdrant payloads.
+KB_ENABLE_IMAGES = os.getenv("KB_ENABLE_IMAGES", "false").strip().lower() in {"1", "true", "yes", "y"}
+
 # ── KB auto-sync (per-agent) ───────────────────────────────────────────────────
 
 KB_POLL_MINUTES = int(os.getenv("KB_POLL_MINUTES", "30"))
@@ -291,8 +327,18 @@ async def chat(agent_name: str, req: ChatRequest, request: Request):
             yield crisis_msg
         return StreamingResponse(crisis_stream(), media_type="text/plain; charset=utf-8")
 
-    # POSITION 2 — semantic response cache
-    cached = get_cached_response(req.message)
+    # Low-info queries (e.g. "break") — avoid random retrieval/cached answers
+    if _is_low_info_query(req.message):
+        async def clarify_stream():
+            yield (
+                "Can you add a bit more detail so I can help? "
+                "For example: ‘I need a break from my program — what are my options?’ or "
+                "‘What are the application deadlines?’"
+            )
+        return StreamingResponse(clarify_stream(), media_type="text/plain; charset=utf-8")
+
+    # POSITION 2 — semantic response cache (agent-scoped)
+    cached = get_cached_response(req.message, agent_id=agent_name)
     if cached:
         print(f"  [CACHE HIT] sim={cached['similarity']} | {cached['original_query'][:60]}")
         async def cached_stream():
@@ -345,16 +391,18 @@ async def chat(agent_name: str, req: ChatRequest, request: Request):
         return StreamingResponse(no_results(), media_type="text/plain; charset=utf-8")
 
     # Collect unique image IDs from all retrieved chunks (preserve order)
-    seen: set[str] = set()
+    # Only used if KB_ENABLE_IMAGES is on.
     image_ids: list[str] = []
-    for r in results:
-        for img_id in r.get("image_ids", []):
-            if img_id and img_id not in seen:
-                image_ids.append(img_id)
-                seen.add(img_id)
+    if KB_ENABLE_IMAGES:
+        seen: set[str] = set()
+        for r in results:
+            for img_id in r.get("image_ids", []):
+                if img_id and img_id not in seen:
+                    image_ids.append(img_id)
+                    seen.add(img_id)
 
-    if image_ids:
-        print(f"--- IMAGES: {image_ids}")
+        if image_ids:
+            print(f"--- IMAGES: {image_ids}")
 
     guardrails = AGENTS[agent_name].get("guardrails", "")
 
@@ -368,13 +416,13 @@ async def chat(agent_name: str, req: ChatRequest, request: Request):
         total_latency_ms = int((time.monotonic() - t_request) * 1000)
 
         answered = not any(p in full.lower() for p in _NO_INFO_PHRASES)
-        if image_ids and answered:
+        if KB_ENABLE_IMAGES and image_ids and answered:
             yield f"\n__IMAGES__:{','.join(image_ids)}"
 
         # POSITION 4 — store in cache and session (skip on LLM errors or 503)
         is_llm_error = full.lower().startswith("error generating response")
         if not is_llm_error:
-            store_cached_response(req.message, full)
+            store_cached_response(req.message, full, agent_id=agent_name)
             add_turn(session_id, req.message, full)
 
         eval_result = evaluate_response(
