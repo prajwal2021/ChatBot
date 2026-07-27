@@ -331,9 +331,7 @@ async def chat(agent_name: str, req: ChatRequest, request: Request):
     if _is_low_info_query(req.message):
         async def clarify_stream():
             yield (
-                "Can you add a bit more detail so I can help? "
-                "For example: ‘I need a break from my program — what are my options?’ or "
-                "‘What are the application deadlines?’"
+                "Can you add a bit more detail so I can help? "  
             )
         return StreamingResponse(clarify_stream(), media_type="text/plain; charset=utf-8")
 
