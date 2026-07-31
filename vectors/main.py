@@ -3,9 +3,11 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import re
 import time
 import uuid as _uuid
 from contextlib import asynccontextmanager
+from pathlib import Path as _Path
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
@@ -16,10 +18,9 @@ from pydantic import BaseModel
 from qdrant_client.models import FusionQuery, Fusion, Prefetch, SparseVector
 
 from agents_config import AGENTS
-from embeddings import embed, sparse_embed
+from embeddings import embed, embed_batch, sparse_embed, sparse_embed_batch
 from qdrant_store import get_client
 from ingest import download_sharepoint, run_ingestion_from_bytes, ingest_to_collection  # noqa: F401
-from pathlib import Path as _Path
 from llm import stream_answer
 from logger import log_interaction, log_error
 from evaluator import evaluate_response, is_crisis_query
@@ -70,7 +71,29 @@ KB_ENABLE_IMAGES = os.getenv("KB_ENABLE_IMAGES", "false").strip().lower() in {"1
 KB_POLL_MINUTES = int(os.getenv("KB_POLL_MINUTES", "30"))
 
 # hash state per agent_id
-_kb_hashes: dict[str, str] = {}
+_kb_hashes_path = _Path(__file__).parent / "logs" / "kb_hashes.json"
+
+
+def _load_kb_hashes() -> dict[str, str]:
+    try:
+        import json
+        if _kb_hashes_path.exists():
+            return json.loads(_kb_hashes_path.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {}
+
+
+def _save_kb_hashes(hashes: dict[str, str]) -> None:
+    try:
+        import json
+        _kb_hashes_path.parent.mkdir(parents=True, exist_ok=True)
+        _kb_hashes_path.write_text(json.dumps(hashes, indent=2, sort_keys=True), encoding="utf-8")
+    except Exception:
+        pass
+
+
+_kb_hashes: dict[str, str] = _load_kb_hashes()
 
 
 async def _check_agent(agent_id: str, cfg: dict) -> None:
@@ -87,6 +110,7 @@ async def _check_agent(agent_id: str, cfg: dict) -> None:
         logger.info(f"KB watcher [{agent_id}]: change detected in {filename}, re-ingesting...")
         count = run_ingestion_from_bytes(data, filename, cfg["collection"], full=True)
         _kb_hashes[agent_id] = current_hash
+        _save_kb_hashes(_kb_hashes)
         logger.info(f"KB watcher [{agent_id}]: indexed {count} chunks into '{cfg['collection']}'")
     except Exception as e:
         logger.error(f"KB watcher [{agent_id}] error: {e}")
@@ -161,34 +185,216 @@ _ingest_status: dict = {"state": "idle", "detail": ""}
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 def _search_collection(collection: str, message: str, top_k: int = 5) -> list[dict]:
-    """Hybrid dense+sparse search against a named collection."""
-    dense_vector = embed(message)
-    sv = sparse_embed(message)
+    """Hybrid dense+sparse search against a named collection.
+
+    For multi-topic questions, we expand into a few sub-queries and merge results
+    so retrieval covers all parts of the user request.
+    """
+    queries = _expand_queries(message)
+    dense_vectors = embed_batch(queries) if len(queries) > 1 else [embed(message)]
+    sparse_vectors = sparse_embed_batch(queries) if len(queries) > 1 else [sparse_embed(message)]
     client = get_client()
-    response = client.query_points(
-        collection_name=collection,
-        prefetch=[
-            Prefetch(query=dense_vector, using="dense", limit=top_k * 2),
-            Prefetch(
-                query=SparseVector(indices=sv[0], values=sv[1]),
-                using="sparse",
-                limit=top_k * 2,
-            ),
-        ],
-        query=FusionQuery(fusion=Fusion.RRF),
-        limit=top_k,
-        with_payload=True,
-    )
-    return [
-        {
-            "text": r.payload.get("text", ""),
-            "source": r.payload.get("source", ""),
-            "chunk_index": r.payload.get("chunk_index", 0),
-            "score": r.score,
-            "image_ids": r.payload.get("image_ids", []),
-        }
-        for r in response.points
+
+    per_query_k = max(5, top_k)
+    merged: dict[tuple[str, int], dict] = {}
+
+    for dense_vector, sv in zip(dense_vectors, sparse_vectors):
+        response = client.query_points(
+            collection_name=collection,
+            prefetch=[
+                Prefetch(query=dense_vector, using="dense", limit=per_query_k * 2),
+                Prefetch(
+                    query=SparseVector(indices=sv[0], values=sv[1]),
+                    using="sparse",
+                    limit=per_query_k * 2,
+                ),
+            ],
+            query=FusionQuery(fusion=Fusion.RRF),
+            limit=per_query_k,
+            with_payload=True,
+        )
+        for r in response.points:
+            source = r.payload.get("source", "")
+            chunk_index = int(r.payload.get("chunk_index", 0) or 0)
+            key = (source, chunk_index)
+            candidate = {
+                "text": r.payload.get("text", ""),
+                "source": source,
+                "chunk_index": chunk_index,
+                "score": r.score,
+                "image_ids": r.payload.get("image_ids", []),
+            }
+            prev = merged.get(key)
+            if prev is None or candidate["score"] > prev["score"]:
+                merged[key] = candidate
+
+    return sorted(merged.values(), key=lambda x: x["score"], reverse=True)[:top_k]
+
+
+def _looks_multi_topic(message: str) -> bool:
+    m = (message or "").lower()
+    if m.count("?") >= 2:
+        return True
+    if any(sep in m for sep in ["; ", "\n", " and ", " also ", " plus ", " as well as "]):
+        return len(m.split()) >= 10
+    return False
+
+
+def _expand_queries(message: str) -> list[str]:
+    raw = (message or "").strip()
+    if not raw:
+        return [""]
+
+    if not _looks_multi_topic(raw):
+        return [raw]
+
+    # Split on obvious separators, keep a small number of focused sub-queries.
+    parts = re.split(r"(?:\n+|;|\?|(?:\s+and\s+)|(?:\s+also\s+)|(?:\s+plus\s+))", raw, flags=re.IGNORECASE)
+    queries: list[str] = []
+    seen: set[str] = set()
+    for p in parts:
+        p = (p or "").strip(" \t-:").strip()
+        if len(p) < 6:
+            continue
+        key = p.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        queries.append(p)
+        if len(queries) >= 3:
+            break
+
+    return queries or [raw]
+
+
+def _is_topics_query(message: str) -> bool:
+    m = (message or "").strip().lower()
+    if not m:
+        return False
+    triggers = [
+        "all major topics",
+        "all topics",
+        "major topics",
+        "topics available",
+        "what topics",
+        "what can you help with",
+        "what can you do",
+        "what do you cover",
+        "what questions can i ask",
+        "capabilities",
     ]
+    return any(t in m for t in triggers)
+
+
+def _extract_topic_candidates(text: str) -> str | None:
+    if not text:
+        return None
+    first = (text.splitlines()[0] or "").strip()
+    if not first:
+        return None
+    if len(first) > 100:
+        return None
+    lowered = first.lower()
+    if lowered in {"question", "answer", "yes", "no", "meta"}:
+        return None
+    if lowered.startswith(("http://", "https://")):
+        return None
+    if first.endswith((".", "?", ",", ";", ":")):
+        return None
+    if first.startswith(("Step ", "- ", "• ")):
+        return None
+    return first
+
+
+def _list_kb_sources(collection: str) -> list[str]:
+    client = get_client()
+    sources: set[str] = set()
+    offset = None
+    while True:
+        points, offset = client.scroll(
+            collection_name=collection,
+            limit=256,
+            with_payload=True,
+            with_vectors=False,
+            offset=offset,
+        )
+        if not points:
+            break
+        for p in points:
+            payload = p.payload or {}
+            s = (payload.get("source", "") or "").strip()
+            if s:
+                sources.add(s)
+        if offset is None:
+            break
+    return sorted(sources, key=lambda x: x.lower())
+
+
+def _major_topics_for_agent(agent_name: str) -> list[str]:
+    if agent_name == "ttu-online":
+        return [
+            "Programs & degrees offered (undergrad/grad)",
+            "Admissions requirements & application steps",
+            "Application deadlines, start dates, and academic calendar",
+            "Tuition/fees and tuition estimator guidance",
+            "Transfer credits and prerequisites (when in KB)",
+            "Registration: add/drop/withdrawal and common Raiderlink steps (when in KB)",
+            "Financial aid basics and who to contact (when in KB)",
+            "Industry Career Certificates (when in KB)",
+            "Contact info, office hours, and support resources",
+        ]
+    if agent_name == "k12":
+        return [
+            "Program overview and enrollment basics",
+            "Courses, pacing, and academic policies (when in KB)",
+            "Tuition/fees and payment guidance (when in KB)",
+            "Support contacts and common troubleshooting steps (when in KB)",
+        ]
+    return [
+        "Answer questions that appear in the indexed documents",
+        "Provide contact info and next steps when available",
+    ]
+
+
+def _list_kb_topics(collection: str, min_repeats: int = 2) -> dict[str, list[str]]:
+    """Return {source: [topics...]} derived from chunk-leading headings.
+
+    We treat a "topic" as a chunk-leading heading that repeats across multiple
+    chunks (via section heading stamping in ingestion). This filters out noise
+    like single-line artifacts.
+    """
+    client = get_client()
+    counts_by_source: dict[str, dict[str, int]] = {}
+    offset = None
+    while True:
+        points, offset = client.scroll(
+            collection_name=collection,
+            limit=256,
+            with_payload=True,
+            with_vectors=False,
+            offset=offset,
+        )
+        if not points:
+            break
+        for p in points:
+            payload = p.payload or {}
+            source = payload.get("source", "") or "unknown"
+            text = payload.get("text", "") or ""
+            section = (payload.get("section", "") or "").strip()
+            topic = section if section else _extract_topic_candidates(text)
+            if not topic:
+                continue
+            counts_by_source.setdefault(source, {})
+            counts_by_source[source][topic] = counts_by_source[source].get(topic, 0) + 1
+        if offset is None:
+            break
+
+    topics_by_source: dict[str, list[str]] = {}
+    for source, counts in counts_by_source.items():
+        topics = [t for t, n in counts.items() if n >= min_repeats]
+        topics_by_source[source] = sorted(topics, key=lambda t: (-counts.get(t, 0), t.lower()))
+
+    return {k: v for k, v in sorted(topics_by_source.items(), key=lambda kv: kv[0].lower())}
 
 
 # ── Health ─────────────────────────────────────────────────────────────────────
@@ -335,6 +541,26 @@ async def chat(agent_name: str, req: ChatRequest, request: Request):
             )
         return StreamingResponse(clarify_stream(), media_type="text/plain; charset=utf-8")
 
+    # "What topics can you cover?" — answer from the KB index directly so the
+    # response is complete (not limited by retrieval top_k).
+    if _is_topics_query(req.message):
+        sources = _list_kb_sources(collection)
+        topics = _major_topics_for_agent(agent_name)
+
+        async def topics_stream():
+            yield "**Major topics I can help with**\n\n"
+            for t in topics:
+                yield f"- {t}\n"
+
+            yield "\n**Knowledge base files indexed right now**\n\n"
+            if not sources:
+                yield "- (none indexed)\n"
+                return
+            for s in sources:
+                yield f"- {s}\n"
+
+        return StreamingResponse(topics_stream(), media_type="text/plain; charset=utf-8")
+
     # POSITION 2 — semantic response cache (agent-scoped)
     cached = get_cached_response(req.message, agent_id=agent_name)
     if cached:
@@ -352,7 +578,10 @@ async def chat(agent_name: str, req: ChatRequest, request: Request):
 
     try:
         t0 = time.monotonic()
-        results = _search_collection(collection, req.message, top_k=7)
+        base_k = 7
+        if _looks_multi_topic(req.message):
+            base_k = 12
+        results = _search_collection(collection, req.message, top_k=base_k)
         retrieval_latency_ms = int((time.monotonic() - t0) * 1000)
     except Exception as e:
         log_error(

@@ -11,11 +11,27 @@ load_dotenv()
 _client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY", ""))
 _DEBUG = os.getenv("DEBUG", "false").lower() == "true"
 
-FALLBACK_MODELS = [
-    "gpt-4o-mini",
-    "gpt-4o",
-    "gpt-4.1-mini",
-]
+def _parse_model_list(value: str) -> list[str]:
+    return [m.strip() for m in (value or "").split(",") if m.strip()]
+
+
+def get_fallback_models() -> list[str]:
+    """Ordered list of models to try.
+
+    Override with `OPENAI_CHAT_MODELS` as a comma-separated list.
+    """
+    env_models = os.getenv("OPENAI_CHAT_MODELS", "").strip()
+    if env_models:
+        return _parse_model_list(env_models)
+
+    # Safe defaults: try GPT‑5.6 first, then fall back to older known-good models.
+    return [
+        "gpt-5.6",
+        "gpt-5.6-terra",
+        "gpt-4o-mini",
+        "gpt-4o",
+        "gpt-4.1-mini",
+    ]
 
 SYSTEM_PROMPT = """You are the TTU Online+ assistant for Texas Tech University.
 You help students and staff with questions about TTU Online+ programs, admissions,
@@ -89,6 +105,28 @@ def _is_quota_error(e: Exception) -> bool:
     return "insufficient_quota" in err or "rate_limit" in err.lower() or "429" in err
 
 
+def _is_model_fallback_error(e: Exception) -> bool:
+    """Errors where we should try the next model slug."""
+    status = getattr(e, "status_code", None)
+    if status in {400, 401, 403, 404}:
+        return True
+
+    err = str(e).lower()
+    return any(
+        s in err
+        for s in [
+            "model",
+            "does not exist",
+            "not found",
+            "no such model",
+            "invalid model",
+            "unsupported model",
+            "you do not have access",
+            "permission",
+        ]
+    )
+
+
 # ── Streaming ─────────────────────────────────────────────────────────────────
 
 async def stream_answer(
@@ -113,15 +151,15 @@ async def stream_answer(
             messages.append({"role": role, "content": content})
     messages.append({"role": "user", "content": prompt})
 
-    for model_name in FALLBACK_MODELS:
-        print(f"Trying model: {model_name} | max_tokens=2048 | history={len(messages)-2} turns")
+    for model_name in get_fallback_models():
+        print(f"Trying model: {model_name} | max_completion_tokens=2048 | history={len(messages)-2} turns")
         try:
             full = ""
             stream = await _client.chat.completions.create(
                 model=model_name,
                 messages=messages,
                 temperature=0.2,
-                max_tokens=2048,
+                max_completion_tokens=2048,
                 stream=True,
             )
             async for chunk in stream:
@@ -142,8 +180,8 @@ async def stream_answer(
             return
 
         except Exception as e:
-            if _is_quota_error(e):
-                print(f"  {model_name} quota exceeded, trying next...")
+            if _is_quota_error(e) or _is_model_fallback_error(e):
+                print(f"  {model_name} failed ({type(e).__name__}), trying next...")
                 continue
             else:
                 yield f"Error generating response: {e}"

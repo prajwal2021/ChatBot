@@ -41,12 +41,11 @@ from qdrant_client.models import (
 )
 
 from agents_config import AGENTS
-from embeddings import embed_batch, sparse_embed_batch
+from embeddings import VECTOR_DIM, embed_batch, sparse_embed_batch
 from qdrant_store import get_client, reset_collection, upsert_points
 
 CHUNK_TOKENS = 600
 OVERLAP_TOKENS = 75
-VECTOR_DIM = 384
 
 # When false, we ignore all images found in .docx files and index text-only.
 # This avoids saving image binaries and avoids the UI "__IMAGES__" protocol.
@@ -224,6 +223,13 @@ def _detect_heading(unit: str) -> bool:
     unit = unit.strip()
     if not unit or "\n" in unit:
         return False
+    lowered = unit.lower()
+    if lowered in {"question", "answer", "yes", "no", "meta"}:
+        return False
+    if lowered.startswith(("http://", "https://")):
+        return False
+    if len(unit) < 4:
+        return False
     if len(unit) > 100:
         return False
     if unit.endswith((".", "?", ",", ";", ":")):
@@ -255,7 +261,7 @@ def _split_into_units(text: str) -> list[str]:
     return units
 
 
-def chunk_text(text: str) -> list[str]:
+def chunk_text_with_sections(text: str) -> tuple[list[str], list[str]]:
     units = _split_into_units(text)
     chunks: list[str] = []
     chunk_sections: list[str] = []   # section active when each chunk was started
@@ -294,15 +300,22 @@ def chunk_text(text: str) -> list[str]:
 
     # Prepend section heading to any chunk that crossed a section boundary
     # without carrying the heading in its overlap text.
-    result: list[str] = []
+    result_chunks: list[str] = []
+    result_sections: list[str] = []
     for chunk, section in zip(chunks, chunk_sections):
         if _token_count(chunk) <= 20:
             continue
         if section and not chunk.strip().startswith(section):
             chunk = f"{section}\n\n{chunk}"
-        result.append(chunk)
+        result_chunks.append(chunk)
+        result_sections.append(section)
 
-    return result
+    return result_chunks, result_sections
+
+
+def chunk_text(text: str) -> list[str]:
+    chunks, _sections = chunk_text_with_sections(text)
+    return chunks
 
 
 # ── Core pipeline ─────────────────────────────────────────────────────────────
@@ -366,7 +379,7 @@ def ingest_to_collection(
 
     If KB_ENABLE_IMAGES is false (default), we will not store any image IDs.
     """
-    raw_chunks = chunk_text(text)
+    raw_chunks, sections = chunk_text_with_sections(text)
     clean_chunks: list[str] = []
     payloads: list[dict] = []
     for i, raw in enumerate(raw_chunks):
@@ -376,6 +389,7 @@ def ingest_to_collection(
             "text": clean,
             "source": source_name,
             "chunk_index": i,
+            "section": (sections[i] if i < len(sections) else ""),
             "image_ids": img_ids if KB_ENABLE_IMAGES else [],
         })
     _embed_and_upsert(clean_chunks, payloads, collection_name, full)
@@ -450,7 +464,7 @@ def ingest_agent(agent_name: str, full: bool = False) -> None:
         else:
             text = extract_text_from_file(f)
 
-        raw_chunks = chunk_text(text)
+        raw_chunks, sections = chunk_text_with_sections(text)
         print(f"     ✂️  {len(raw_chunks)} chunks")
 
         for i, raw in enumerate(raw_chunks):
@@ -460,6 +474,7 @@ def ingest_agent(agent_name: str, full: bool = False) -> None:
                 "text": clean,
                 "source": f.name,
                 "chunk_index": i,
+                "section": (sections[i] if i < len(sections) else ""),
                 "image_ids": chunk_imgs if KB_ENABLE_IMAGES else [],
             })
 

@@ -14,12 +14,13 @@ from qdrant_client.models import (
     VectorParams,
 )
 
+from embeddings import VECTOR_DIM
+
 load_dotenv()
 
 QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 COLLECTION = os.getenv("QDRANT_COLLECTION", "ttu_kb")
-VECTOR_DIM = 384
 
 
 def get_client() -> QdrantClient:

@@ -1,22 +1,23 @@
 from __future__ import annotations
 
-from fastembed import SparseTextEmbedding
-from sentence_transformers import SentenceTransformer
+import os
+import time
 
-MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
-VECTOR_DIM = 384
+from fastembed import SparseTextEmbedding
+from dotenv import load_dotenv
+from openai import OpenAI
+
+load_dotenv()
+
+EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-large").strip()
+_EMBEDDING_DIMS_RAW = os.getenv("OPENAI_EMBEDDING_DIMENSIONS", "").strip()
+VECTOR_DIM = int(_EMBEDDING_DIMS_RAW) if _EMBEDDING_DIMS_RAW else 3072
+_BATCH_SIZE = int(os.getenv("OPENAI_EMBEDDING_BATCH_SIZE", "96"))
+
+_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY", ""))
 SPARSE_MODEL_NAME = "Qdrant/bm25"
 
-_model: SentenceTransformer | None = None
 _sparse_model: SparseTextEmbedding | None = None
-
-
-def get_model() -> SentenceTransformer:
-    global _model
-    if _model is None:
-        print(f"Loading {MODEL_NAME} (first run downloads ~90 MB)...")
-        _model = SentenceTransformer(MODEL_NAME)
-    return _model
 
 
 def get_sparse_model() -> SparseTextEmbedding:
@@ -29,12 +30,44 @@ def get_sparse_model() -> SparseTextEmbedding:
 
 # ── Dense ──────────────────────────────────────────────────────────────────────
 
+def _batches(items: list[str], batch_size: int) -> list[list[str]]:
+    if batch_size <= 0:
+        return [items]
+    return [items[i:i + batch_size] for i in range(0, len(items), batch_size)]
+
+
+def _embed_batch_openai(texts: list[str]) -> list[list[float]]:
+    if not texts:
+        return []
+
+    out: list[list[float]] = []
+    kwargs: dict = {"model": EMBEDDING_MODEL, "input": texts}
+    if _EMBEDDING_DIMS_RAW:
+        kwargs["dimensions"] = VECTOR_DIM
+
+    # Simple retry for transient rate limiting
+    for attempt in range(6):
+        try:
+            resp = _client.embeddings.create(**kwargs)
+            out.extend([d.embedding for d in resp.data])
+            return out
+        except Exception as e:
+            status = getattr(e, "status_code", None)
+            if status == 429 and attempt < 5:
+                time.sleep(0.5 * (2 ** attempt))
+                continue
+            raise
+
+
 def embed(text: str) -> list[float]:
-    return get_model().encode(text, normalize_embeddings=True).tolist()
+    return embed_batch([text])[0]
 
 
 def embed_batch(texts: list[str]) -> list[list[float]]:
-    return get_model().encode(texts, normalize_embeddings=True).tolist()
+    vectors: list[list[float]] = []
+    for batch in _batches(texts, _BATCH_SIZE):
+        vectors.extend(_embed_batch_openai(batch))
+    return vectors
 
 
 # ── Sparse (BM25) ──────────────────────────────────────────────────────────────
