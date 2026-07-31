@@ -21,7 +21,7 @@ from agents_config import AGENTS
 from embeddings import embed, embed_batch, sparse_embed, sparse_embed_batch
 from qdrant_store import get_client
 from ingest import download_sharepoint, run_ingestion_from_bytes, ingest_to_collection  # noqa: F401
-from llm import stream_answer
+from llm import generate_clarification, resolve_intent, stream_answer
 from logger import log_interaction, log_error
 from evaluator import evaluate_response, is_crisis_query
 from cache import get_cached_response, store_cached_response
@@ -306,30 +306,6 @@ def _extract_topic_candidates(text: str) -> str | None:
     return first
 
 
-def _list_kb_sources(collection: str) -> list[str]:
-    client = get_client()
-    sources: set[str] = set()
-    offset = None
-    while True:
-        points, offset = client.scroll(
-            collection_name=collection,
-            limit=256,
-            with_payload=True,
-            with_vectors=False,
-            offset=offset,
-        )
-        if not points:
-            break
-        for p in points:
-            payload = p.payload or {}
-            s = (payload.get("source", "") or "").strip()
-            if s:
-                sources.add(s)
-        if offset is None:
-            break
-    return sorted(sources, key=lambda x: x.lower())
-
-
 def _major_topics_for_agent(agent_name: str) -> list[str]:
     if agent_name == "ttu-online":
         return [
@@ -337,18 +313,18 @@ def _major_topics_for_agent(agent_name: str) -> list[str]:
             "Admissions requirements & application steps",
             "Application deadlines, start dates, and academic calendar",
             "Tuition/fees and tuition estimator guidance",
-            "Transfer credits and prerequisites (when in KB)",
-            "Registration: add/drop/withdrawal and common Raiderlink steps (when in KB)",
-            "Financial aid basics and who to contact (when in KB)",
-            "Industry Career Certificates (when in KB)",
+            "Transfer credits and prerequisites",
+            "Registration: add/drop/withdrawal and common Raiderlink steps",
+            "Financial aid basics and who to contact",
+            "Industry Career Certificates",
             "Contact info, office hours, and support resources",
         ]
     if agent_name == "k12":
         return [
             "Program overview and enrollment basics",
-            "Courses, pacing, and academic policies (when in KB)",
-            "Tuition/fees and payment guidance (when in KB)",
-            "Support contacts and common troubleshooting steps (when in KB)",
+            "Courses, pacing, and academic policies",
+            "Tuition/fees and payment guidance",
+            "Support contacts and common troubleshooting steps",
         ]
     return [
         "Answer questions that appear in the indexed documents",
@@ -533,18 +509,9 @@ async def chat(agent_name: str, req: ChatRequest, request: Request):
             yield crisis_msg
         return StreamingResponse(crisis_stream(), media_type="text/plain; charset=utf-8")
 
-    # Low-info queries (e.g. "break") — avoid random retrieval/cached answers
-    if _is_low_info_query(req.message):
-        async def clarify_stream():
-            yield (
-                "Can you add a bit more detail so I can help? "  
-            )
-        return StreamingResponse(clarify_stream(), media_type="text/plain; charset=utf-8")
-
     # "What topics can you cover?" — answer from the KB index directly so the
     # response is complete (not limited by retrieval top_k).
     if _is_topics_query(req.message):
-        sources = _list_kb_sources(collection)
         topics = _major_topics_for_agent(agent_name)
 
         async def topics_stream():
@@ -552,36 +519,53 @@ async def chat(agent_name: str, req: ChatRequest, request: Request):
             for t in topics:
                 yield f"- {t}\n"
 
-            yield "\n**Knowledge base files indexed right now**\n\n"
-            if not sources:
-                yield "- (none indexed)\n"
-                return
-            for s in sources:
-                yield f"- {s}\n"
-
         return StreamingResponse(topics_stream(), media_type="text/plain; charset=utf-8")
 
+    # Use the conversation history supplied by the frontend. Keep Redis as a
+    # fallback for existing API clients that use a stable session_id.
+    history_dicts = [turn.model_dump() for turn in req.history]
+    if not history_dicts:
+        session_turns = get_history(session_id)
+        for turn in session_turns:
+            history_dicts.append({"role": "user",      "content": turn["query"]})
+            history_dicts.append({"role": "assistant",  "content": turn["response"]})
+
+    guardrails = AGENTS[agent_name].get("guardrails", "")
+    intent = await resolve_intent(
+        req.message,
+        guardrails=guardrails,
+        history=history_dicts,
+    )
+    if intent["action"] == "clarify":
+        clarification = intent["clarification_question"]
+
+        async def intent_clarification_stream():
+            yield clarification
+            add_turn(session_id, req.message, clarification)
+
+        return StreamingResponse(
+            intent_clarification_stream(),
+            media_type="text/plain; charset=utf-8",
+        )
+
+    retrieval_query = intent["rewritten_query"] or req.message
+
     # POSITION 2 — semantic response cache (agent-scoped)
-    cached = get_cached_response(req.message, agent_id=agent_name)
+    # Contextual follow-ups cannot safely share a response cached by message text
+    # alone because the same phrase can refer to different prior answers.
+    cached = get_cached_response(req.message, agent_id=agent_name) if not req.history else None
     if cached:
         print(f"  [CACHE HIT] sim={cached['similarity']} | {cached['original_query'][:60]}")
         async def cached_stream():
             yield cached["response"]
         return StreamingResponse(cached_stream(), media_type="text/plain; charset=utf-8")
 
-    # POSITION 3 — Redis session history (replaces req.history)
-    session_turns = get_history(session_id)
-    history_dicts: list[dict] = []
-    for turn in session_turns:
-        history_dicts.append({"role": "user",      "content": turn["query"]})
-        history_dicts.append({"role": "assistant",  "content": turn["response"]})
-
     try:
         t0 = time.monotonic()
         base_k = 7
-        if _looks_multi_topic(req.message):
+        if _looks_multi_topic(retrieval_query):
             base_k = 12
-        results = _search_collection(collection, req.message, top_k=base_k)
+        results = _search_collection(collection, retrieval_query, top_k=base_k)
         retrieval_latency_ms = int((time.monotonic() - t0) * 1000)
     except Exception as e:
         log_error(
@@ -591,6 +575,8 @@ async def chat(agent_name: str, req: ChatRequest, request: Request):
         raise HTTPException(status_code=503, detail=f"Retrieval error: {e}")
 
     print(f"\n--- [{agent_name}] QUERY: {req.message}")
+    if retrieval_query != req.message:
+        print(f"--- REWRITTEN QUERY: {retrieval_query}")
     print(f"--- CHUNKS RETRIEVED: {len(results)} ({retrieval_latency_ms}ms)")
     for i, r in enumerate(results):
         print(f"  [{i+1}] score={r['score']:.3f} | {r['text'][:80]}...")
@@ -613,9 +599,20 @@ async def chat(agent_name: str, req: ChatRequest, request: Request):
     }
 
     if not results:
-        async def no_results():
-            yield "I don't have that information in the current knowledge base. Try rephrasing your question."
-        return StreamingResponse(no_results(), media_type="text/plain; charset=utf-8")
+        clarification = await generate_clarification(
+            req.message,
+            guardrails=guardrails,
+            history=history_dicts,
+        )
+
+        async def no_results_clarification_stream():
+            yield clarification
+            add_turn(session_id, req.message, clarification)
+
+        return StreamingResponse(
+            no_results_clarification_stream(),
+            media_type="text/plain; charset=utf-8",
+        )
 
     # Collect unique image IDs from all retrieved chunks (preserve order)
     # Only used if KB_ENABLE_IMAGES is on.
@@ -630,8 +627,6 @@ async def chat(agent_name: str, req: ChatRequest, request: Request):
 
         if image_ids:
             print(f"--- IMAGES: {image_ids}")
-
-    guardrails = AGENTS[agent_name].get("guardrails", "")
 
     async def streamer():
         full = ""
@@ -649,7 +644,8 @@ async def chat(agent_name: str, req: ChatRequest, request: Request):
         # POSITION 4 — store in cache and session (skip on LLM errors or 503)
         is_llm_error = full.lower().startswith("error generating response")
         if not is_llm_error:
-            store_cached_response(req.message, full, agent_id=agent_name)
+            if not req.history:
+                store_cached_response(req.message, full, agent_id=agent_name)
             add_turn(session_id, req.message, full)
 
         eval_result = evaluate_response(
