@@ -21,6 +21,7 @@ AGENTS: dict[str, dict] = {
         ],
         "scope_terms": [
             r"\bttu\b", r"\btexas tech\b", r"\bonline\+?\b", r"\bdegree\b",
+            r"\b(?:ph\.?d\.?|doctoral|doctorate)\b",
             r"\bprograms?\b", r"\badmission\b", r"\bapplication\b", r"\btuition\b",
             r"\bpayment plan\b", r"\bebill\b", r"\braiderlink\b", r"\bfinancial aid\b",
             r"\btransfer credits?\b", r"\bregister\b", r"\bregistration\b",
@@ -61,6 +62,7 @@ AGENTS: dict[str, dict] = {
             r"\bfocus portal\b", r"\bcounselor portal\b", r"\bstudents?\b",
             r"\bcourses?\b", r"\bcredit by exam\b", r"\bcbe\b", r"\btuition\b",
             r"\bfees?\b", r"\bdiploma\b", r"\btranscript\b", r"\bproctorio\b",
+            r"\bexams?\b", r"\bwebcam\b", r"\bmicrophone\b", r"\btechnical support\b",
             r"\bteacher\b", r"\bgrades?\b", r"\benroll(?:ment)?\b", r"\bprogram\b",
             r"\bsupport (?:number|phone|email)\b",
         ],

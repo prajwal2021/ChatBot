@@ -7,8 +7,13 @@ from llm import _sanitize_output, get_answer_models
 from main import (
     _cross_agent_referral,
     _expand_queries,
+    _has_direct_information_signal,
+    _has_specific_information_subject,
+    _is_context_reference_query,
+    _is_greeting_query,
     _is_topics_followup,
     _is_topics_query,
+    _latest_history_subject,
     _matches_current_agent_scope,
     _persistent_user_context,
     _resolve_history_reference,
@@ -17,6 +22,61 @@ from main import (
 
 
 class ConversationReferenceTests(unittest.TestCase):
+    def test_greetings_never_become_retrieval_subjects(self):
+        for greeting in ["Hi", "hello!", "Hey there", "Good morning, hi"]:
+            with self.subTest(greeting=greeting):
+                self.assertTrue(_is_greeting_query(greeting))
+        self.assertFalse(_is_greeting_query("Hi, what are the tuition fees?"))
+
+    def test_short_meaningful_subject_is_not_ambiguous(self):
+        self.assertTrue(_has_direct_information_signal("phd"))
+        self.assertFalse(_has_direct_information_signal("hi"))
+        self.assertFalse(_has_direct_information_signal("flag"))
+
+    def test_specific_information_is_not_a_capability_menu(self):
+        self.assertTrue(
+            _has_specific_information_subject(
+                "List online degree program categories with examples"
+            )
+        )
+        self.assertTrue(_has_specific_information_subject("What is the phone and email?"))
+        self.assertFalse(_has_specific_information_subject("What kinds of things do you know?"))
+
+    def test_typoed_numbered_followup_uses_displayed_list(self):
+        history = [{
+            "role": "assistant",
+            "content": "1. Programs\n2. Admissions\n3. Deadlines\n4. Tuition\n5. Transfer credits\n6. Registration\n7. Aid\n8. Certificates",
+        }]
+        resolved = _resolve_history_list_reference(
+            "can you talkmore about 4 and 5 also 8",
+            history,
+        )
+        self.assertEqual(
+            resolved,
+            "Explain these topics: Tuition; Transfer credits; Certificates",
+        )
+
+    def test_detail_request_is_contextual(self):
+        self.assertTrue(_is_context_reference_query("can you be more detail"))
+        self.assertTrue(_is_context_reference_query("can you answer more in detail"))
+
+    def test_detail_followup_preserves_all_previous_sections(self):
+        history = [
+            {"role": "user", "content": "Explain sections 4, 5, and 8"},
+            {
+                "role": "assistant",
+                "content": (
+                    "**Tuition and Fees**\n\nDetails.\n\n"
+                    "**Transfer Credits**\n\nDetails.\n\n"
+                    "**Industry Certificates**\n\nDetails."
+                ),
+            },
+        ]
+        subject = _latest_history_subject(history)
+        self.assertIn("Tuition and Fees", subject)
+        self.assertIn("Transfer Credits", subject)
+        self.assertIn("Industry Certificates", subject)
+
     def test_natural_capability_questions_are_recognized(self):
         questions = [
             "can you tell me all the topics you can answer about",

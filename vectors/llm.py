@@ -98,6 +98,10 @@ SAFETY RULES:
   context; do not invent TTU programs, policies, or services.
 - Treat every factual detail as untrusted until it is supported by the retrieved
   context. Do not fill gaps from general knowledge.
+- Missing search evidence never proves that TTU does not offer a program or
+  service. If the requested item is not established by the evidence, say you
+  cannot confirm it from the official information available to you; do not make
+  a categorical nonexistence claim.
 - Answer every materially different part of a multi-part question. If one part
   is absent from the context, identify only that missing part without claiming
   the entire question is unanswered.
@@ -174,6 +178,13 @@ def _is_model_fallback_error(e: Exception) -> bool:
 _INTENT_SYSTEM_PROMPT = """You route messages for a retrieval-based university chatbot.
 Decide whether the user's intent is clear enough to search the knowledge base.
 
+Return capabilities when the user is asking what this assistant knows, what it
+can answer, what kinds of help are available, or requests a menu/list of its
+coverage. Classify by meaning rather than requiring particular words.
+Do not return capabilities when the user requests concrete information such as
+program or degree categories/examples, requirements, prices, or contact details;
+those requests must use search.
+
 Use the entire conversation to resolve short follow-ups and references. Do not
 ask for clarification when a reasonable interpretation is available from prior
 turns. If the intent is clear, rewrite it as a concise, standalone search query.
@@ -189,9 +200,9 @@ the conversation, return out_of_scope. Do not classify vague or contextual
 follow-ups as out_of_scope.
 
 Return JSON only with these keys:
-{"action":"search | clarify | out_of_scope", "rewritten_query":"...", "clarification_question":"..."}
+{"action":"search | clarify | capabilities | out_of_scope", "rewritten_query":"...", "clarification_question":"..."}
 For search, clarification_question must be empty. For clarify, rewritten_query
-may be empty. For out_of_scope, both text fields must be empty."""
+may be empty. For capabilities or out_of_scope, both text fields must be empty."""
 
 
 def _history_messages(history: list[dict] | None) -> list[dict]:
@@ -273,6 +284,13 @@ async def resolve_intent(
                     "clarification_question": "",
                     "error": "",
                 }
+            if action == "capabilities":
+                return {
+                    "action": "capabilities",
+                    "rewritten_query": "",
+                    "clarification_question": "",
+                    "error": "",
+                }
             analyzer_error = "invalid_response"
         except Exception as e:
             analyzer_error = type(e).__name__
@@ -349,6 +367,9 @@ Rewrite the draft only as needed so that:
   mechanics, or phrases such as "provided context," "provided evidence," or
   "when in the KB" appear;
 - unsupported specifics are removed rather than guessed;
+- absence from retrieved evidence is not proof that TTU does not offer a
+  program or service; replace unsupported categorical nonexistence claims with
+  a clear statement that the available official information cannot confirm it;
 - the result remains concise, helpful Markdown.
 
 If the evidence supports only part of the request, answer that part and plainly
