@@ -21,7 +21,7 @@ from agents_config import AGENTS
 from embeddings import embed, embed_batch, sparse_embed, sparse_embed_batch
 from qdrant_store import get_client
 from ingest import download_sharepoint, run_ingestion_from_bytes, ingest_to_collection  # noqa: F401
-from llm import generate_clarification, resolve_intent, stream_answer
+from llm import generate_clarification, get_answer_models, resolve_intent, stream_answer
 from logger import log_interaction, log_error
 from evaluator import evaluate_response, is_crisis_query
 from cache import get_cached_response, store_cached_response
@@ -61,6 +61,223 @@ def _is_low_info_query(text: str) -> bool:
 
     # Otherwise treat 1-2 word fragments as too ambiguous.
     return True
+
+
+def _is_context_reference_query(text: str) -> bool:
+    """True when a message depends on an earlier turn for its meaning."""
+    t = (text or "").strip().lower()
+    reference_words = r"(?:point|points|item|items|number|numbers|option|options)"
+    if re.search(rf"\b{reference_words}\s*(?:#\s*)?\d+", t):
+        return True
+    if re.search(r"\b(?:talk about|explain|discuss|cover|tell me about)\s+(?:#\s*)?\d+\b", t):
+        return True
+    return bool(
+        re.search(
+            r"\b(this|that|these|those|them|it|the previous one|the last one|"
+            r"the above|more about|more information)\b",
+            t,
+        )
+    )
+
+
+def _requests_exhaustive_answer(text: str) -> bool:
+    """True when the user explicitly asks for the complete available answer."""
+    t = (text or "").strip().lower()
+    return bool(
+        re.search(
+            r"\b(all|everything|list all|show all|tell me all|every option|complete list)\b",
+            t,
+        )
+    )
+
+
+def _has_direct_information_signal(text: str) -> bool:
+    """Detect a usable subject without hard-coding program-specific questions."""
+    tokens = re.findall(r"[a-z0-9]+", (text or "").lower())
+    generic = {
+        "a", "about", "an", "and", "are", "can", "could", "do", "does",
+        "cannot", "doesnt", "everything", "for", "help", "i", "information",
+        "is", "issue", "it", "me", "more", "my", "need", "not", "of", "on",
+        "or", "please", "problem", "question",
+        "something", "stuff", "tell", "that", "the", "these", "thing", "this",
+        "to", "want", "what", "when", "where", "which", "who", "why", "with",
+        "work", "working", "would", "you",
+    }
+    meaningful = [token for token in tokens if len(token) >= 3 and token not in generic]
+    return bool(meaningful)
+
+
+def _list_items_from_assistant_message(content: str) -> dict[int, str]:
+    """Extract the top-level numbered or bulleted list from an assistant turn."""
+    numbered: dict[int, str] = {}
+    bullets: list[tuple[int, str]] = []
+    for line in (content or "").splitlines():
+        # Accept plain and Markdown-emphasized lists, including
+        # "**1. Heading**" and "1. **Heading**".
+        numbered_match = re.match(
+            r"^\s*(?:\*\*|__)?\s*(\d+)[.)]\s+(.+?)\s*(?:\*\*|__)?\s*$",
+            line,
+        )
+        if numbered_match:
+            item = re.sub(r"^(?:\*\*|__)|(?:\*\*|__)$", "", numbered_match.group(2).strip())
+            numbered[int(numbered_match.group(1))] = item.strip()
+            continue
+        bullet_match = re.match(r"^(\s*)[-*•]\s+(.+?)\s*$", line)
+        if bullet_match:
+            bullets.append((len(bullet_match.group(1)), bullet_match.group(2)))
+
+    if numbered:
+        return numbered
+    if not bullets:
+        return {}
+
+    min_indent = min(indent for indent, _ in bullets)
+    top_level = [item for indent, item in bullets if indent == min_indent]
+    return {i + 1: item for i, item in enumerate(top_level)}
+
+
+def _resolve_history_list_reference(message: str, history: list[dict]) -> str | None:
+    """Resolve requests like "point 2 and 3" against the latest assistant list."""
+    normalized = re.sub(r"[^a-z0-9]+", " ", (message or "").lower()).strip()
+    all_previous_items = normalized in {
+        "all", "everything", "all of them", "list them all", "show me all",
+        "tell me everything",
+    }
+    if not _is_context_reference_query(message) and not all_previous_items:
+        return None
+
+    lowered = (message or "").lower()
+    numbers: list[int] = []
+    if re.search(r"\b(?:point|points|item|items|number|numbers|option|options)\b", lowered):
+        numbers = [int(n) for n in re.findall(r"\d+", lowered)]
+    else:
+        bare = re.search(
+            r"\b(?:talk about|explain|discuss|cover|tell me about)\s+(?:#\s*)?(\d+)\b",
+            lowered,
+        )
+        if bare:
+            numbers = [int(bare.group(1))]
+
+    if not numbers and not all_previous_items:
+        return None
+
+    for turn in reversed(history):
+        if turn.get("role") != "assistant":
+            continue
+        items = _list_items_from_assistant_message(turn.get("content", ""))
+        if all_previous_items and items:
+            return "Explain all of these topics: " + "; ".join(items.values())
+        selected = [items[n] for n in numbers if n in items]
+        if len(selected) == len(numbers):
+            return "Explain these topics: " + "; ".join(selected)
+    return None
+
+
+def _latest_history_subject(history: list[dict]) -> str | None:
+    """Return a concise subject from the most recent substantive exchange."""
+    latest_user = ""
+    latest_heading = ""
+    for turn in reversed(history):
+        content = (turn.get("content") or "").strip()
+        if not content:
+            continue
+        if turn.get("role") == "assistant" and not latest_heading:
+            for line in content.splitlines():
+                clean = re.sub(r"^[#>*_\-\s]+|[*_\s]+$", "", line).strip()
+                if 3 <= len(clean) <= 140:
+                    latest_heading = clean
+                    break
+        elif turn.get("role") == "user" and not latest_user:
+            if _has_direct_information_signal(content):
+                latest_user = content[:240]
+        if latest_heading and latest_user:
+            break
+
+    parts = []
+    if latest_heading:
+        parts.append(latest_heading)
+    if latest_user and latest_user.lower() not in latest_heading.lower():
+        parts.append(latest_user)
+    return "; ".join(parts) or None
+
+
+def _resolve_history_reference(message: str, history: list[dict]) -> str | None:
+    """Create a standalone query for non-list pronoun/context follow-ups."""
+    if not history:
+        return None
+    list_reference = _resolve_history_list_reference(message, history)
+    if list_reference:
+        return list_reference
+    if not _is_context_reference_query(message):
+        return None
+    subject = _latest_history_subject(history)
+    if not subject:
+        return None
+    return f"Regarding {subject}: {message.strip()}"
+
+
+_CONTEXT_PATTERNS = (
+    r"\b(?:i am|i'm|we are|we're|we live|i live|my child|my son|my daughter|"
+    r"i work|i have|we have|i already|we already)\b",
+)
+
+
+def _persistent_user_context(history: list[dict]) -> list[str]:
+    """Extract durable user circumstances for retrieval and answer prioritization."""
+    lines: list[str] = []
+    seen: set[str] = set()
+    for turn in history:
+        if turn.get("role") != "user":
+            continue
+        content = re.sub(r"\s+", " ", (turn.get("content") or "").strip())
+        if not content or not any(re.search(p, content, re.IGNORECASE) for p in _CONTEXT_PATTERNS):
+            continue
+        key = content.lower()
+        if key not in seen:
+            seen.add(key)
+            lines.append(content[:300])
+    return lines[-4:]
+
+
+def _cross_agent_referral(agent_name: str, message: str) -> str | None:
+    """Route explicit questions for another configured TTU assistant."""
+    current = AGENTS.get(agent_name, {})
+    lowered = (message or "").lower()
+    for other_name, cfg in AGENTS.items():
+        if other_name == agent_name:
+            continue
+        terms = cfg.get("routing_terms", [])
+        if not any(re.search(term, lowered, re.IGNORECASE) for term in terms):
+            continue
+        contact = cfg.get("contact", {})
+        label = cfg.get("display_name", other_name)
+        details = [contact.get("phone", ""), contact.get("email", ""), contact.get("url", "")]
+        details = [value for value in details if value]
+        suffix = f" You can contact them at {', '.join(details)}." if details else ""
+        return f"That question is handled by {label}, rather than {current.get('display_name', agent_name)}.{suffix}"
+    return None
+
+
+def _matches_current_agent_scope(agent_name: str, message: str) -> bool:
+    lowered = (message or "").lower()
+    cfg = AGENTS.get(agent_name, {})
+    patterns = list(cfg.get("routing_terms", [])) + list(cfg.get("scope_terms", []))
+    return any(re.search(pattern, lowered, re.IGNORECASE) for pattern in patterns)
+
+
+def _out_of_scope_response(agent_name: str, message: str) -> str:
+    """Return a concise boundary with an appropriate non-chatbot referral."""
+    label = AGENTS.get(agent_name, {}).get("display_name", agent_name)
+    lowered = (message or "").lower()
+    if re.search(r"\b(medication|medicine|dose|dosage|diagnos|symptom|medical|health)\b", lowered):
+        referral = "Please consult a qualified healthcare professional."
+    elif re.search(r"\b(legal|lawsuit|attorney|lawyer)\b", lowered):
+        referral = "Please consult a qualified legal professional."
+    elif re.search(r"\b(invest|tax|stock|financial advice)\b", lowered):
+        referral = "Please consult a qualified financial professional."
+    else:
+        referral = "Please use an appropriate trusted resource for that topic."
+    return f"That topic is outside the scope of {label}. {referral}"
 
 # When false, the backend will not emit the UI image protocol (__IMAGES__) even if
 # image_ids exist in Qdrant payloads.
@@ -197,8 +414,9 @@ def _search_collection(collection: str, message: str, top_k: int = 5) -> list[di
 
     per_query_k = max(5, top_k)
     merged: dict[tuple[str, int], dict] = {}
+    ranked_by_query: list[list[dict]] = []
 
-    for dense_vector, sv in zip(dense_vectors, sparse_vectors):
+    for query_index, (dense_vector, sv) in enumerate(zip(dense_vectors, sparse_vectors)):
         response = client.query_points(
             collection_name=collection,
             prefetch=[
@@ -213,7 +431,8 @@ def _search_collection(collection: str, message: str, top_k: int = 5) -> list[di
             limit=per_query_k,
             with_payload=True,
         )
-        for r in response.points:
+        query_results: list[dict] = []
+        for query_rank, r in enumerate(response.points):
             source = r.payload.get("source", "")
             chunk_index = int(r.payload.get("chunk_index", 0) or 0)
             key = (source, chunk_index)
@@ -221,14 +440,60 @@ def _search_collection(collection: str, message: str, top_k: int = 5) -> list[di
                 "text": r.payload.get("text", ""),
                 "source": source,
                 "chunk_index": chunk_index,
+                "section": r.payload.get("section", ""),
                 "score": r.score,
                 "image_ids": r.payload.get("image_ids", []),
+                "query_index": query_index,
+                "query_rank": query_rank,
             }
+            query_results.append(candidate)
             prev = merged.get(key)
             if prev is None or candidate["score"] > prev["score"]:
                 merged[key] = candidate
+        query_text = queries[query_index].lower()
+        if re.search(r"\b(cost|price|pricing|fee|how much)\b", query_text):
+            query_results.sort(
+                key=lambda item: (
+                    not bool(re.search(r"\$\s*\d|\b(?:cost|fee|price)\b", item["text"], re.IGNORECASE)),
+                    item["query_rank"],
+                )
+            )
+        elif re.search(r"\b(duration|time limit|how long)\b", query_text):
+            query_results.sort(
+                key=lambda item: (
+                    not bool(re.search(r"\b\d+\s*(?:days?|months?|weeks?|years?)\b", item["text"], re.IGNORECASE)),
+                    item["query_rank"],
+                )
+            )
+        ranked_by_query.append(query_results)
 
-    return sorted(merged.values(), key=lambda x: x["score"], reverse=True)[:top_k]
+    # Reserve coverage for every sub-query before filling remaining slots by
+    # score. This prevents one easy part of a multi-part question from crowding
+    # all other requested parts out of the context window.
+    selected: list[dict] = []
+    selected_keys: set[tuple[str, int]] = set()
+    minimum_per_query = max(1, min(3, top_k // max(1, len(ranked_by_query))))
+    for query_results in ranked_by_query:
+        added = 0
+        for candidate in query_results:
+            key = (candidate["source"], candidate["chunk_index"])
+            if key in selected_keys:
+                continue
+            selected.append(candidate)
+            selected_keys.add(key)
+            added += 1
+            if added >= minimum_per_query or len(selected) >= top_k:
+                break
+
+    remaining = sorted(merged.values(), key=lambda x: x["score"], reverse=True)
+    for candidate in remaining:
+        if len(selected) >= top_k:
+            break
+        key = (candidate["source"], candidate["chunk_index"])
+        if key not in selected_keys:
+            selected.append(candidate)
+            selected_keys.add(key)
+    return selected
 
 
 def _looks_multi_topic(message: str) -> bool:
@@ -237,6 +502,8 @@ def _looks_multi_topic(message: str) -> bool:
         return True
     if any(sep in m for sep in ["; ", "\n", " and ", " also ", " plus ", " as well as "]):
         return len(m.split()) >= 10
+    if len(re.findall(r"\b(?:what|how|when|where|who|which|whether|can|does|do|is|are)\b", m)) >= 2:
+        return True
     return False
 
 
@@ -246,24 +513,92 @@ def _expand_queries(message: str) -> list[str]:
         return [""]
 
     if not _looks_multi_topic(raw):
-        return [raw]
+        queries = [raw]
+        if re.search(r"\b(?:fee|fees|cost|costs|price|pricing|tuition)\b", raw, re.IGNORECASE):
+            queries.append(
+                f"{raw} complete cost fee pricing amounts all types categories"
+            )
+        return queries
 
-    # Split on obvious separators, keep a small number of focused sub-queries.
-    parts = re.split(r"(?:\n+|;|\?|(?:\s+and\s+)|(?:\s+also\s+)|(?:\s+plus\s+))", raw, flags=re.IGNORECASE)
+    enumerated_request = raw.count(",") >= 3
+    if enumerated_request:
+        parts = re.split(r"(?:\n+|;|,|\s+and\s+(?=(?:what|how|whether|the)\b))", raw, flags=re.IGNORECASE)
+    else:
+        # Split only at boundaries that introduce another question/aspect. A
+        # plain "and" inside a program name or noun phrase is preserved.
+        parts = re.split(
+            r"(?:\n+|;|\?+|,\s*(?=(?:what|how|when|where|who|which|whether|can|does|do|is|are)\b)|"
+            r"\s+and\s+(?=(?:what|how|when|where|who|which|whether|can|does|do|is|are)\b)|"
+            r"\s+(?:also|plus)\s+)",
+            raw,
+            flags=re.IGNORECASE,
+        )
     queries: list[str] = []
     seen: set[str] = set()
+    anchor = ""
     for p in parts:
         p = (p or "").strip(" \t-:").strip()
         if len(p) < 6:
             continue
-        key = p.lower()
+        if not anchor:
+            anchor = p
+            focused = p
+        elif enumerated_request:
+            focused = f"{raw}; Focus specifically on: {p}"
+        else:
+            # Retain the original subject so fragments such as "what score
+            # passes" remain tied to the program/exam named in part one.
+            focused = f"{anchor}; {p}"
+        key = focused.lower()
         if key in seen:
             continue
         seen.add(key)
-        queries.append(p)
-        if len(queries) >= 3:
+        queries.append(focused)
+        if len(queries) >= 8:
             break
 
+    if len(queries) > 1 and raw.lower() not in seen:
+        queries.insert(0, raw)
+
+    # Add intent-preserving lexical variants for common conversational wording.
+    # This helps sparse retrieval match tables/headings that say "fee" or
+    # "duration" rather than the user's natural "how much/how long" phrasing.
+    variants: list[str] = []
+    contextual_subject = re.search(r"\bRegarding\s+(.+?)(?:;|:)", raw, re.IGNORECASE)
+    concise_subject = ""
+    if contextual_subject:
+        concise_subject = contextual_subject.group(1).strip()
+        concise_subject = re.sub(
+            r"\b(?:overview|details|information)\b.*$",
+            "",
+            concise_subject,
+            flags=re.IGNORECASE,
+        ).strip(" :-")
+        concise_subject = re.sub(r"\s*\([^)]{1,24}\)", "", concise_subject).strip()
+        concise_subject = re.sub(r"\s+at\s+.+$", "", concise_subject, flags=re.IGNORECASE).strip()
+        concise_subject = concise_subject or contextual_subject.group(1).strip()
+    if contextual_subject and re.search(r"\bhow much\b", raw, re.IGNORECASE):
+        variants.append(f"{concise_subject} pricing options all types")
+    if contextual_subject and re.search(r"\bhow long\b", raw, re.IGNORECASE):
+        variants.append(f"{concise_subject} duration time limit")
+    for query in queries:
+        variant = re.sub(
+            r"\bhow much\b",
+            "cost price fee pricing options all types",
+            query,
+            flags=re.IGNORECASE,
+        )
+        variant = re.sub(
+            r"\bcosts?\b",
+            "cost price fee pricing amounts",
+            variant,
+            flags=re.IGNORECASE,
+        )
+        variant = re.sub(r"\bhow long\b", "duration time limit", variant, flags=re.IGNORECASE)
+        if variant.lower() != query.lower() and variant.lower() not in seen:
+            variants.append(variant)
+            seen.add(variant.lower())
+    queries.extend(variants[:6])
     return queries or [raw]
 
 
@@ -282,8 +617,25 @@ def _is_topics_query(message: str) -> bool:
         "what do you cover",
         "what questions can i ask",
         "capabilities",
+        "areas you can help",
+        "areas can you help",
     ]
     return any(t in m for t in triggers)
+
+
+def _requested_topic_count(message: str, available: int) -> int:
+    lowered = (message or "").lower()
+    digit = re.search(r"\b(\d{1,2})\b", lowered)
+    if digit:
+        return max(1, min(int(digit.group(1)), available))
+    words = {
+        "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+        "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+    }
+    for word, count in words.items():
+        if re.search(rf"\b{word}\b", lowered):
+            return min(count, available)
+    return available
 
 
 def _extract_topic_candidates(text: str) -> str | None:
@@ -371,6 +723,56 @@ def _list_kb_topics(collection: str, min_repeats: int = 2) -> dict[str, list[str
         topics_by_source[source] = sorted(topics, key=lambda t: (-counts.get(t, 0), t.lower()))
 
     return {k: v for k, v in sorted(topics_by_source.items(), key=lambda kv: kv[0].lower())}
+
+
+def _catalog_context(collection: str) -> dict | None:
+    """Build compact, index-derived context for exhaustive program catalogs."""
+    client = get_client()
+    titles: list[str] = []
+    seen: set[str] = set()
+    offset = None
+    while True:
+        points, offset = client.scroll(
+            collection_name=collection,
+            limit=256,
+            with_payload=True,
+            with_vectors=False,
+            offset=offset,
+        )
+        for point in points:
+            payload = point.payload or {}
+            candidates = [payload.get("section", "")]
+            text = payload.get("text", "") or ""
+            if text:
+                candidates.append(text.splitlines()[0])
+            for candidate in candidates:
+                title = re.sub(r"\s+", " ", (candidate or "").strip())
+                if not title or len(title) > 180:
+                    continue
+                if title.endswith("?"):
+                    continue
+                if not re.search(
+                    r"\b(?:bachelor|master|doctor|degree|certificate)\b",
+                    title,
+                    re.IGNORECASE,
+                ):
+                    continue
+                key = title.lower()
+                if key not in seen:
+                    seen.add(key)
+                    titles.append(title)
+        if offset is None:
+            break
+    if not titles:
+        return None
+    return {
+        "text": "Available program and degree titles:\n" + "\n".join(f"- {title}" for title in titles),
+        "source": "",
+        "chunk_index": -1,
+        "section": "Program catalog",
+        "score": 1.0,
+        "image_ids": [],
+    }
 
 
 # ── Health ─────────────────────────────────────────────────────────────────────
@@ -513,11 +915,14 @@ async def chat(agent_name: str, req: ChatRequest, request: Request):
     # response is complete (not limited by retrieval top_k).
     if _is_topics_query(req.message):
         topics = _major_topics_for_agent(agent_name)
+        topics = topics[:_requested_topic_count(req.message, len(topics))]
+        topic_response = "**Major topics I can help with**\n\n" + "\n".join(
+            f"{i}. {topic}" for i, topic in enumerate(topics, start=1)
+        )
 
         async def topics_stream():
-            yield "**Major topics I can help with**\n\n"
-            for t in topics:
-                yield f"- {t}\n"
+            yield topic_response
+            add_turn(session_id, req.message, topic_response)
 
         return StreamingResponse(topics_stream(), media_type="text/plain; charset=utf-8")
 
@@ -531,24 +936,149 @@ async def chat(agent_name: str, req: ChatRequest, request: Request):
             history_dicts.append({"role": "assistant",  "content": turn["response"]})
 
     guardrails = AGENTS[agent_name].get("guardrails", "")
-    intent = await resolve_intent(
-        req.message,
-        guardrails=guardrails,
-        history=history_dicts,
-    )
-    if intent["action"] == "clarify":
-        clarification = intent["clarification_question"]
+    route_response = _cross_agent_referral(agent_name, req.message)
+    if route_response:
+        async def cross_agent_stream():
+            yield route_response
+            add_turn(session_id, req.message, route_response)
 
-        async def intent_clarification_stream():
+        return StreamingResponse(cross_agent_stream(), media_type="text/plain; charset=utf-8")
+
+    reference_query = _resolve_history_reference(req.message, history_dicts)
+    persistent_context = _persistent_user_context(history_dicts)
+
+    # One- or two-word fragments without a conversational referent are not safe
+    # retrieval queries. Use nearby KB material only to formulate a useful,
+    # dynamic clarification question; never answer from an arbitrary top hit.
+    if (
+        _is_low_info_query(req.message)
+        or not _has_direct_information_signal(req.message)
+    ) and not reference_query:
+        candidate_chunks: list[dict] = []
+        try:
+            candidate_chunks = _search_collection(collection, req.message, top_k=3)
+        except Exception:
+            pass
+        clarification = await generate_clarification(
+            req.message,
+            guardrails=guardrails,
+            history=history_dicts,
+            chunks=candidate_chunks,
+        )
+
+        async def low_info_clarification_stream():
             yield clarification
             add_turn(session_id, req.message, clarification)
 
         return StreamingResponse(
-            intent_clarification_stream(),
+            low_info_clarification_stream(),
             media_type="text/plain; charset=utf-8",
         )
 
+    if reference_query:
+        intent = {
+            "action": "context_reference",
+            "rewritten_query": reference_query,
+            "clarification_question": "",
+            "error": "",
+        }
+    else:
+        intent = await resolve_intent(
+            req.message,
+            guardrails=guardrails,
+            history=history_dicts,
+        )
+
+    if intent["action"] == "unavailable":
+        print(
+            f"--- INTENT ANALYZER UNAVAILABLE: {intent.get('error', 'unknown')} "
+            f"| history={len(history_dicts)}"
+        )
+        if _is_context_reference_query(req.message) or _is_low_info_query(req.message):
+            clarification = await generate_clarification(
+                req.message,
+                guardrails=guardrails,
+                history=history_dicts,
+            )
+
+            async def analyzer_failure_clarification_stream():
+                yield clarification
+                add_turn(session_id, req.message, clarification)
+
+            return StreamingResponse(
+                analyzer_failure_clarification_stream(),
+                media_type="text/plain; charset=utf-8",
+            )
+
+        intent = {
+            "action": "search_fallback",
+            "rewritten_query": req.message,
+            "clarification_question": "",
+            "error": intent.get("error", ""),
+        }
+
+    if intent["action"] == "clarify":
+        # A broad but identifiable subject should be answered from all available
+        # KB evidence. Clarification is reserved for messages with no usable
+        # subject, such as "I need help" or an unresolved contextual reference.
+        if _requests_exhaustive_answer(req.message) or _has_direct_information_signal(req.message):
+            intent = {
+                "action": "search_broad",
+                "rewritten_query": req.message,
+                "clarification_question": "",
+                "error": "",
+            }
+        else:
+            clarification = intent["clarification_question"]
+
+            async def intent_clarification_stream():
+                yield clarification
+                add_turn(session_id, req.message, clarification)
+
+            return StreamingResponse(
+                intent_clarification_stream(),
+                media_type="text/plain; charset=utf-8",
+            )
+
+    if intent["action"] == "out_of_scope":
+        # The probabilistic classifier cannot veto an explicit match for the
+        # current assistant's own vocabulary. Continue to retrieval in that
+        # case; only deterministic cross-agent routing happens earlier.
+        if _matches_current_agent_scope(agent_name, req.message):
+            intent = {
+                "action": "search_broad",
+                "rewritten_query": req.message,
+                "clarification_question": "",
+                "error": "",
+            }
+        else:
+            scope_response = _out_of_scope_response(agent_name, req.message)
+
+            async def out_of_scope_stream():
+                yield scope_response
+                add_turn(session_id, req.message, scope_response)
+
+            return StreamingResponse(out_of_scope_stream(), media_type="text/plain; charset=utf-8")
+
     retrieval_query = intent["rewritten_query"] or req.message
+    if _looks_multi_topic(req.message) and intent["action"] != "context_reference":
+        # Preserve the user's complete wording. Intent rewrites sometimes
+        # compress enumerated requirements and make a requested aspect
+        # invisible to query decomposition.
+        retrieval_query = req.message
+    answer_question = req.message
+    if intent["action"] == "context_reference":
+        answer_question = retrieval_query
+
+    retrieval_query_with_context = retrieval_query
+    if persistent_context:
+        context_text = "; ".join(persistent_context)
+        if context_text.lower() not in retrieval_query.lower():
+            retrieval_query_with_context = f"{retrieval_query}. User context: {context_text}"
+    print(
+        f"--- INTENT: {intent['action']} | history={len(history_dicts)} "
+        f"| rewritten={retrieval_query_with_context!r}"
+    )
 
     # POSITION 2 — semantic response cache (agent-scoped)
     # Contextual follow-ups cannot safely share a response cached by message text
@@ -563,9 +1093,22 @@ async def chat(agent_name: str, req: ChatRequest, request: Request):
     try:
         t0 = time.monotonic()
         base_k = 7
-        if _looks_multi_topic(retrieval_query):
-            base_k = 12
-        results = _search_collection(collection, retrieval_query, top_k=base_k)
+        if _requests_exhaustive_answer(req.message):
+            base_k = 40
+        elif (
+            intent["action"] == "search_broad"
+            or _looks_multi_topic(req.message)
+            or _looks_multi_topic(retrieval_query_with_context)
+        ):
+            base_k = 18
+        results = _search_collection(collection, retrieval_query_with_context, top_k=base_k)
+        if (
+            _requests_exhaustive_answer(req.message)
+            and re.search(r"\b(?:programs?|degrees?|certificates?)\b", req.message, re.IGNORECASE)
+        ):
+            catalog = _catalog_context(collection)
+            if catalog:
+                results.insert(0, catalog)
         retrieval_latency_ms = int((time.monotonic() - t0) * 1000)
     except Exception as e:
         log_error(
@@ -575,14 +1118,20 @@ async def chat(agent_name: str, req: ChatRequest, request: Request):
         raise HTTPException(status_code=503, detail=f"Retrieval error: {e}")
 
     print(f"\n--- [{agent_name}] QUERY: {req.message}")
-    if retrieval_query != req.message:
-        print(f"--- REWRITTEN QUERY: {retrieval_query}")
+    if retrieval_query_with_context != req.message:
+        print(f"--- REWRITTEN QUERY: {retrieval_query_with_context}")
     print(f"--- CHUNKS RETRIEVED: {len(results)} ({retrieval_latency_ms}ms)")
     for i, r in enumerate(results):
         print(f"  [{i+1}] score={r['score']:.3f} | {r['text'][:80]}...")
 
     retrieval_result = {
         "method": "hybrid",
+        "intent": {
+            "action": intent["action"],
+            "history_turns": len(history_dicts),
+            "rewritten_query": retrieval_query_with_context,
+            "analyzer_error": intent.get("error", ""),
+        },
         "chunks_retrieved": len(results),
         "retrieval_latency_ms": retrieval_latency_ms,
         "chunks": [
@@ -631,7 +1180,13 @@ async def chat(agent_name: str, req: ChatRequest, request: Request):
     async def streamer():
         full = ""
         t_llm = time.monotonic()
-        async for chunk in stream_answer(req.message, results, guardrails=guardrails, history=history_dicts):
+        async for chunk in stream_answer(
+            answer_question,
+            results,
+            guardrails=guardrails,
+            history=history_dicts,
+            user_context=persistent_context,
+        ):
             full += chunk
             yield chunk
         llm_latency_ms   = int((time.monotonic() - t_llm) * 1000)
@@ -666,7 +1221,7 @@ async def chat(agent_name: str, req: ChatRequest, request: Request):
             retrieval_result=retrieval_result,
             response_result={
                 "text": full,
-                "model_used": "gpt-4o-mini",
+                "model_used": get_answer_models()[0],
                 "prompt_tokens": 0,
                 "completion_tokens": 0,
                 "tokens_used": 0,

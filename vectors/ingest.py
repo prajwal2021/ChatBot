@@ -44,7 +44,7 @@ from agents_config import AGENTS
 from embeddings import VECTOR_DIM, embed_batch, sparse_embed_batch
 from qdrant_store import get_client, reset_collection, upsert_points
 
-CHUNK_TOKENS = 600
+CHUNK_TOKENS = 450
 OVERLAP_TOKENS = 75
 
 # When false, we ignore all images found in .docx files and index text-only.
@@ -204,7 +204,9 @@ def extract_docx_rich(
             lines.append(f"- {text}")
         elif "Heading" in style_name:
             step_counter = 0
-            lines.append(f"\n{text}")
+            # Preserve an explicit structural boundary for the chunker. The
+            # marker is removed before embedding and never reaches the chatbot.
+            lines.append(f"[SECTION] {text}")
         else:
             step_counter = 0
             lines.append(text)
@@ -219,14 +221,21 @@ def _token_count(text: str) -> int:
 
 
 def _detect_heading(unit: str) -> bool:
-    """True if this unit looks like a section-heading (short, no trailing punctuation)."""
+    """True if this unit looks like a real document title/section heading."""
     unit = unit.strip()
+    if unit.startswith("[SECTION] "):
+        return True
     if not unit or "\n" in unit:
         return False
     lowered = unit.lower()
     if lowered in {"question", "answer", "yes", "no", "meta"}:
         return False
     if lowered.startswith(("http://", "https://")):
+        return False
+    # Monetary/table rows are data belonging to the current section, even when
+    # their first column is title-cased. Splitting them loses the relationship
+    # between labels, headers, and values.
+    if "$" in unit or "\t" in unit or " | " in unit:
         return False
     if len(unit) < 4:
         return False
@@ -236,29 +245,52 @@ def _detect_heading(unit: str) -> bool:
         return False
     if unit.startswith(("Step ", "- ", "• ")):
         return False
-    return True
+    words = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ0-9+&'-]+", unit)
+    if not words or len(words) > 15:
+        return False
+    letters = [word for word in words if re.search(r"[A-Za-zÀ-ÖØ-öø-ÿ]", word)]
+    if not letters:
+        return False
+    title_like = sum(word[:1].isupper() for word in letters) / len(letters)
+    return unit.isupper() or title_like >= 0.75
 
 
 def _split_into_units(text: str) -> list[str]:
     units: list[str] = []
-    for para in re.split(r"\n{2,}", text):
-        para = para.strip()
-        if not para:
+    # DOCX extraction emits one meaningful paragraph per line. Treating only
+    # blank-line-separated blocks as units allowed unrelated FAQ entries to be
+    # packed into the same chunk and overlap into the next entry.
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
             continue
-        if _token_count(para) <= CHUNK_TOKENS:
-            units.append(para)
+        if _token_count(line) <= CHUNK_TOKENS:
+            units.append(line)
         else:
-            for line in para.split("\n"):
-                line = line.strip()
-                if not line:
+            for sent in re.split(r"(?<=[.!?])\s+", line):
+                sent = sent.strip()
+                if not sent:
                     continue
-                if _token_count(line) <= CHUNK_TOKENS:
-                    units.append(line)
-                else:
-                    for sent in re.split(r"(?<=[.!?])\s+", line):
-                        if sent.strip():
-                            units.append(sent.strip())
+                token_ids = _tokenizer.encode(sent, add_special_tokens=False)
+                if len(token_ids) <= CHUNK_TOKENS:
+                    units.append(sent)
+                    continue
+                for start in range(0, len(token_ids), CHUNK_TOKENS):
+                    piece = _tokenizer.decode(token_ids[start:start + CHUNK_TOKENS]).strip()
+                    if piece:
+                        units.append(piece)
     return units
+
+
+def _is_hard_section_boundary(unit: str) -> bool:
+    clean = unit.strip()
+    if clean.startswith("[SECTION] "):
+        return True
+    # FAQ questions are reliable semantic boundaries even when the source DOCX
+    # does not assign heading styles to them.
+    if clean.endswith("?") and 3 <= len(clean) <= 240:
+        return True
+    return _detect_heading(clean)
 
 
 def chunk_text_with_sections(text: str) -> tuple[list[str], list[str]]:
@@ -271,10 +303,23 @@ def chunk_text_with_sections(text: str) -> tuple[list[str], list[str]]:
     next_chunk_section: str = ""     # section to stamp on the chunk being built
 
     for unit in units:
-        if _detect_heading(unit):
-            current_section = unit.strip()
+        hard_boundary = _is_hard_section_boundary(unit)
+        clean_unit = re.sub(r"^\[SECTION\]\s*", "", unit).strip()
 
-        unit_tokens = _token_count(unit)
+        if hard_boundary and current_units:
+            # Do not carry token overlap across document/FAQ boundaries.
+            chunks.append("\n\n".join(current_units))
+            chunk_sections.append(next_chunk_section)
+            current_units = []
+            current_tokens = 0
+            next_chunk_section = ""
+
+        if _detect_heading(unit) or hard_boundary:
+            current_section = clean_unit
+            if not current_units:
+                next_chunk_section = current_section
+
+        unit_tokens = _token_count(clean_unit)
         if current_tokens + unit_tokens > CHUNK_TOKENS and current_units:
             chunks.append("\n\n".join(current_units))
             chunk_sections.append(next_chunk_section)
@@ -291,7 +336,7 @@ def chunk_text_with_sections(text: str) -> tuple[list[str], list[str]]:
             current_tokens = overlap_tokens
             next_chunk_section = current_section   # next chunk belongs to current section
 
-        current_units.append(unit)
+        current_units.append(clean_unit)
         current_tokens += unit_tokens
 
     if current_units:
@@ -303,14 +348,37 @@ def chunk_text_with_sections(text: str) -> tuple[list[str], list[str]]:
     result_chunks: list[str] = []
     result_sections: list[str] = []
     for chunk, section in zip(chunks, chunk_sections):
-        if _token_count(chunk) <= 20:
+        # Short FAQ answers can still be complete and important (for example a
+        # price, deadline, or one-step instruction). Discard only near-empty
+        # structural fragments.
+        if _token_count(chunk) <= 3:
             continue
         if section and not chunk.strip().startswith(section):
             chunk = f"{section}\n\n{chunk}"
         result_chunks.append(chunk)
         result_sections.append(section)
 
-    return result_chunks, result_sections
+    # Remove table-of-contents question stubs when the same question also has a
+    # substantive answer chunk. Keeping both can cause retrieval to select the
+    # empty stub instead of the answer.
+    substantive_questions: set[str] = set()
+    for chunk in result_chunks:
+        lines = [line.strip() for line in chunk.splitlines() if line.strip()]
+        if len(lines) >= 2 and lines[0].endswith("?"):
+            substantive_questions.add(re.sub(r"\s+", " ", lines[0]).lower())
+
+    filtered_chunks: list[str] = []
+    filtered_sections: list[str] = []
+    for chunk, section in zip(result_chunks, result_sections):
+        lines = [line.strip() for line in chunk.splitlines() if line.strip()]
+        stub = len(lines) == 1 and lines[0].endswith("?")
+        normalized = re.sub(r"\s+", " ", lines[0]).lower() if lines else ""
+        if stub and normalized in substantive_questions:
+            continue
+        filtered_chunks.append(chunk)
+        filtered_sections.append(section)
+
+    return filtered_chunks, filtered_sections
 
 
 def chunk_text(text: str) -> list[str]:
@@ -366,7 +434,15 @@ def _embed_and_upsert(
         )
         for i in range(len(chunks))
     ]
-    client.upsert(collection_name=collection_name, points=points, wait=True)
+    # Qdrant Cloud limits HTTP request bodies. Large, finely segmented KBs can
+    # exceed that limit if all vectors are sent in one request.
+    upsert_batch_size = int(os.getenv("QDRANT_UPSERT_BATCH_SIZE", "128"))
+    for start in range(0, len(points), upsert_batch_size):
+        client.upsert(
+            collection_name=collection_name,
+            points=points[start:start + upsert_batch_size],
+            wait=True,
+        )
 
 
 def ingest_to_collection(

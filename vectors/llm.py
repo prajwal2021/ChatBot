@@ -16,31 +16,45 @@ def _parse_model_list(value: str) -> list[str]:
     return [m.strip() for m in (value or "").split(",") if m.strip()]
 
 
-def get_fallback_models() -> list[str]:
-    """Ordered list of models to try.
-
-    Override with `OPENAI_CHAT_MODELS` as a comma-separated list.
-    """
+def get_answer_models() -> list[str]:
+    """Ordered, deployable answer models (override with OPENAI_CHAT_MODELS)."""
     env_models = os.getenv("OPENAI_CHAT_MODELS", "").strip()
     if env_models:
         return _parse_model_list(env_models)
+    # These model IDs are supported by the configured OpenAI API. The previous
+    # GPT-5.6 identifiers were not valid API model IDs and caused a 400 on every
+    # request before silently falling back.
+    return ["gpt-4o", "gpt-4o-mini"]
 
-    # Safe defaults: try GPT‑5.6 first, then fall back to older known-good models.
-    return [
-        "gpt-5.6",
-        "gpt-5.6-terra",
-        "gpt-4o-mini",
-        "gpt-4o",
-        "gpt-4.1-mini",
-    ]
+
+def get_utility_models() -> list[str]:
+    """Smaller models for routing, clarification, and answer verification."""
+    env_models = os.getenv("OPENAI_UTILITY_MODELS", "").strip()
+    if env_models:
+        return _parse_model_list(env_models)
+    return ["gpt-4o-mini", "gpt-4o"]
+
+
+def get_verifier_models() -> list[str]:
+    env_models = os.getenv("OPENAI_VERIFIER_MODELS", "").strip()
+    if env_models:
+        return _parse_model_list(env_models)
+    return ["gpt-4o", "gpt-4o-mini"]
+
+
+# Backward-compatible name for any external imports.
+def get_fallback_models() -> list[str]:
+    return get_answer_models()
 
 SYSTEM_PROMPT = """You are a Texas Tech University assistant.
 Follow the agent-specific scope rules below to help students and staff.
 
-Answer ONLY using the provided context. If more detail from the user could lead
-to a better knowledge-base search, ask one contextual clarification question.
-Only when clarification would not help, say so honestly and direct the user to
-the appropriate team named in the agent-specific scope rules.
+Answer ONLY using the provided context. Answer immediately whenever the context
+supports an answer. For broad questions, provide all relevant information in the
+context instead of asking the user to narrow the request. Only ask one contextual
+clarification when the request has no usable subject or the context cannot support
+a reliable answer. If clarification would not help, direct the user to the
+appropriate team named in the agent-specific scope rules.
 
 RESPONSE FORMAT RULES:
 1. Organize answers into clear sections with bold headers when the answer covers
@@ -49,12 +63,12 @@ RESPONSE FORMAT RULES:
 2. Use bullet points for any list of items (programs, steps, requirements, options).
    Never write a long paragraph when a bulleted list works better.
 
-3. Always include relevant contact information when it appears in the context —
+3. Include relevant contact information when it helps answer the request and appears in the context —
    phone numbers, email addresses, and links must be included in your response,
    not omitted.
 
-4. End every response with a helpful next step — a relevant link, a contact,
-   or an offer to help further.
+4. Include a next step only when it is useful. Do not add an unrelated support
+   referral to an out-of-scope response.
 
 5. Never repeat the same information twice in one response.
 
@@ -72,14 +86,23 @@ SAFETY RULES:
 - Determine whether a question is within scope using the full conversation, not
   only the latest message. Resolve references such as "this," "that," "number 5,"
   and "more information" from earlier turns.
+- Use relevant details the user shared anywhere in the conversation, including
+  their location, role, and situation, to prioritize the most applicable parts
+  of the answer while still providing everything they requested.
 - Only give an out-of-scope response when the topic is genuinely unrelated to the
   agent's TTU program and cannot be understood from the conversation history.
 - Never give an out-of-scope response when the user is referring to information
   from a previous assistant response.
-- If the user's intent or the retrieved context is not specific enough to answer
-  reliably, ask one short, natural clarification question instead of saying that
-  the information is unavailable. Base the question on the conversation and the
-  available context; do not invent TTU programs, policies, or services."""
+- Ask a clarification question only when the conversation and retrieved context
+  cannot support a useful answer. Base it on the conversation and available
+  context; do not invent TTU programs, policies, or services.
+- Treat every factual detail as untrusted until it is supported by the retrieved
+  context. Do not fill gaps from general knowledge.
+- Answer every materially different part of a multi-part question. If one part
+  is absent from the context, identify only that missing part without claiming
+  the entire question is unanswered.
+- Never mention knowledge-base filenames, document names, chunks, retrieval,
+  source files, or phrases such as "when in the KB"."""
 
 
 # ── Markdown safety net ───────────────────────────────────────────────────────
@@ -94,9 +117,22 @@ def strip_markdown(text: str) -> str:
 
 # ── Prompt ────────────────────────────────────────────────────────────────────
 
-def build_prompt(question: str, chunks: list[dict]) -> str:
-    retrieved_context = "\n\n".join(c["text"] for c in chunks)
-    return f"Context:\n{retrieved_context}\n\nQuestion: {question}"
+def build_prompt(
+    question: str,
+    chunks: list[dict],
+    user_context: list[str] | None = None,
+) -> str:
+    retrieved_context = "\n\n".join(
+        f"Evidence {i} (section: {c.get('section') or 'unspecified'}):\n{c['text']}"
+        for i, c in enumerate(chunks, start=1)
+    )
+    profile = ""
+    if user_context:
+        profile = "\n\nRelevant user context:\n- " + "\n- ".join(user_context)
+    return (
+        f"Retrieved evidence:\n{retrieved_context}{profile}\n\n"
+        f"Current request:\n{question}"
+    )
 
 
 def _debug_footer(chunks: list[dict]) -> str:
@@ -148,10 +184,14 @@ students. You may include two to four brief choices when useful. Derive the
 question from the conversation and agent scope; never invent specific programs,
 policies, contacts, or services.
 
+If the request is clearly unrelated to the agent scope and is not a reference to
+the conversation, return out_of_scope. Do not classify vague or contextual
+follow-ups as out_of_scope.
+
 Return JSON only with these keys:
-{"action":"search" or "clarify", "rewritten_query":"...", "clarification_question":"..."}
+{"action":"search | clarify | out_of_scope", "rewritten_query":"...", "clarification_question":"..."}
 For search, clarification_question must be empty. For clarify, rewritten_query
-may be empty."""
+may be empty. For out_of_scope, both text fields must be empty."""
 
 
 def _history_messages(history: list[dict] | None) -> list[dict]:
@@ -196,7 +236,8 @@ async def resolve_intent(
     messages.extend(_history_messages(history))
     messages.append({"role": "user", "content": question})
 
-    for model_name in get_fallback_models():
+    analyzer_error = "invalid_response"
+    for model_name in get_utility_models():
         try:
             response = await _client.chat.completions.create(
                 model=model_name,
@@ -216,22 +257,34 @@ async def resolve_intent(
                     "action": "clarify",
                     "rewritten_query": "",
                     "clarification_question": clarification,
+                    "error": "",
                 }
             if action == "search":
                 return {
                     "action": "search",
                     "rewritten_query": rewritten or question,
                     "clarification_question": "",
+                    "error": "",
                 }
+            if action == "out_of_scope":
+                return {
+                    "action": "out_of_scope",
+                    "rewritten_query": "",
+                    "clarification_question": "",
+                    "error": "",
+                }
+            analyzer_error = "invalid_response"
         except Exception as e:
+            analyzer_error = type(e).__name__
             if _is_quota_error(e) or _is_model_fallback_error(e):
                 continue
             break
 
     return {
-        "action": "search",
-        "rewritten_query": question,
+        "action": "unavailable",
+        "rewritten_query": "",
         "clarification_question": "",
+        "error": analyzer_error,
     }
 
 
@@ -257,7 +310,7 @@ request, list unsupported services, or say the information is unavailable."""
         prompt += f"\n\nClosest knowledge-base context:\n{context}"
     messages.append({"role": "user", "content": prompt})
 
-    for model_name in get_fallback_models():
+    for model_name in get_utility_models():
         try:
             response = await _client.chat.completions.create(
                 model=model_name,
@@ -277,6 +330,106 @@ request, list unsupported services, or say the information is unavailable."""
     return "Could you share a little more about what you are trying to do so I can point you to the right information?"
 
 
+# ── Grounding and output validation ──────────────────────────────────────────
+
+_GROUNDING_SYSTEM_PROMPT = """You are the final verifier for a university RAG
+assistant. Return JSON with exactly one key: {"answer":"..."}.
+
+Rewrite the draft only as needed so that:
+- every factual claim, number, deadline, requirement, program detail, contact,
+  and URL is directly supported by the supplied evidence or agent rules;
+- every materially different part of the request is answered when evidence is
+  available;
+- durable user context is respected and used to prioritize relevant details;
+- no adjacent but unrelated FAQ instructions are mixed into the answer;
+- a requirement from one named degree or program is never generalized to all
+  programs; general admissions answers must say requirements vary when the
+  evidence says they vary;
+- no knowledge-base filenames, document names, chunks, sources, retrieval
+  mechanics, or phrases such as "provided context," "provided evidence," or
+  "when in the KB" appear;
+- unsupported specifics are removed rather than guessed;
+- the result remains concise, helpful Markdown.
+
+If the evidence supports only part of the request, answer that part and plainly
+state which specific detail is unavailable. Do not replace an otherwise useful
+answer with a generic refusal or unnecessary clarification."""
+
+
+def _sanitize_output(answer: str, chunks: list[dict], guardrails: str) -> str:
+    """Remove internal/source leakage and invalid or unsupported Markdown links."""
+    clean = (answer or "").strip()
+    clean = re.sub(r"(?i)\b(?:document|source)[-_ ]?\d*\.docx\b", "", clean)
+    clean = re.sub(r"(?im)^.*\bdebug sources?:.*$", "", clean)
+    clean = re.sub(r"(?i)\b(?:when|found|available) in (?:the )?(?:kb|knowledge base)\b", "", clean)
+    clean = re.sub(r"(?i)\b(?:the )?provided (?:context|evidence)\b", "the available information", clean)
+    clean = re.sub(
+        r"(?i)\b(?:the )?available evidence\b",
+        "the official information available to me",
+        clean,
+    )
+
+    allowed_text = "\n".join(c.get("text", "") for c in chunks) + "\n" + guardrails
+
+    def replace_link(match: re.Match) -> str:
+        label = match.group(1).strip()
+        target = match.group(2).strip()
+        if target == "#" or not re.match(r"^(?:https?://|mailto:)", target, re.IGNORECASE):
+            return label
+        if target.lower() not in allowed_text.lower():
+            return label
+        return match.group(0)
+
+    clean = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", replace_link, clean)
+    clean = re.sub(r"[ \t]+\n", "\n", clean)
+    clean = re.sub(r"\n{3,}", "\n\n", clean)
+    return clean.strip()
+
+
+async def _verify_answer(
+    question: str,
+    draft: str,
+    chunks: list[dict],
+    guardrails: str,
+    user_context: list[str] | None,
+) -> str:
+    evidence = "\n\n".join(
+        f"Evidence {i} (section: {c.get('section') or 'unspecified'}):\n{c.get('text', '')}"
+        for i, c in enumerate(chunks, start=1)
+    )
+    profile = "\n".join(f"- {line}" for line in (user_context or [])) or "None supplied"
+    verification_request = (
+        f"Agent rules:\n{guardrails or 'None'}\n\n"
+        f"User context:\n{profile}\n\n"
+        f"Request:\n{question}\n\n"
+        f"Evidence:\n{evidence}\n\n"
+        f"Draft answer:\n{draft}"
+    )
+    messages = [
+        {"role": "system", "content": _GROUNDING_SYSTEM_PROMPT},
+        {"role": "user", "content": verification_request},
+    ]
+    for model_name in get_verifier_models():
+        try:
+            response = await _client.chat.completions.create(
+                model=model_name,
+                messages=messages,
+                temperature=0,
+                max_completion_tokens=2200,
+                response_format={"type": "json_object"},
+            )
+            content = response.choices[0].message.content if response.choices else ""
+            parsed = _parse_json_object(content or "")
+            verified = str(parsed.get("answer", "")).strip()
+            if verified:
+                return _sanitize_output(verified, chunks, guardrails)
+        except Exception as e:
+            if _is_quota_error(e) or _is_model_fallback_error(e):
+                continue
+            break
+    return _sanitize_output(draft, chunks, guardrails)
+
+
 # ── Streaming ─────────────────────────────────────────────────────────────────
 
 async def stream_answer(
@@ -284,8 +437,9 @@ async def stream_answer(
     chunks: list[dict],
     guardrails: str = "",
     history: list[dict] | None = None,
+    user_context: list[str] | None = None,
 ):
-    prompt = build_prompt(question, chunks)
+    prompt = build_prompt(question, chunks, user_context=user_context)
 
     # System instruction = base prompt + per-agent guardrails (applied on every request)
     system_instr = SYSTEM_PROMPT
@@ -297,7 +451,7 @@ async def stream_answer(
     messages.extend(_history_messages(history))
     messages.append({"role": "user", "content": prompt})
 
-    for model_name in get_fallback_models():
+    for model_name in get_answer_models():
         print(f"Trying model: {model_name} | max_completion_tokens=2048 | history={len(messages)-2} turns")
         try:
             full = ""
@@ -313,6 +467,13 @@ async def stream_answer(
                 if delta:
                     full += delta
 
+            full = await _verify_answer(
+                question,
+                full,
+                chunks,
+                guardrails,
+                user_context,
+            )
             print(f"  [{model_name}] {full[:120]}...")
 
             # Stream word-by-word for natural UI feel

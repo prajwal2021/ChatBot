@@ -270,7 +270,11 @@ export default function AgentChatPage() {
         const res = await fetch(`${apiUrl}/chat/${agentId}`, { //api call hit with msg and history
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ message: text, history: historyMessages }),
+          body: JSON.stringify({
+            message: text,
+            session_id: currentId,
+            history: historyMessages,
+          }),
         });
 
         if (!res.ok || !res.body) throw new Error("API error");
