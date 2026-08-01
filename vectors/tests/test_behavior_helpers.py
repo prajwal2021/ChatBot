@@ -56,6 +56,91 @@ class ConversationReferenceTests(unittest.TestCase):
             "Explain these topics: Tuition; Transfer credits; Certificates",
         )
 
+    def test_bare_number_resolves_only_against_a_previous_list(self):
+        history = [{
+            "role": "assistant",
+            "content": "1. Programs\n2. Admissions\n3. Deadlines",
+        }]
+        self.assertEqual(
+            _resolve_history_list_reference("2", history),
+            "Explain these topics: Admissions",
+        )
+        self.assertIsNone(
+            _resolve_history_list_reference(
+                "2",
+                [{"role": "assistant", "content": "Tuition varies by program."}],
+            )
+        )
+
+    def test_point_reference_skips_later_unnumbered_bullets(self):
+        history = [
+            {
+                "role": "assistant",
+                "content": "1. Programs\n2. Admissions\n3. Deadlines",
+            },
+            {"role": "user", "content": "2"},
+            {
+                "role": "assistant",
+                "content": "- General requirements\n- College requirements\n- Transcripts",
+            },
+        ]
+        self.assertEqual(
+            _resolve_history_list_reference("answer for point 2", history),
+            "Explain these topics: Admissions",
+        )
+
+    def test_point_reference_is_not_hijacked_by_later_numbered_steps(self):
+        history = [
+            {
+                "role": "assistant",
+                "content": (
+                    "**Major topics**\n\n"
+                    "1. Programs\n"
+                    "2. Admissions requirements & application steps\n"
+                    "3. Deadlines"
+                ),
+            },
+            {"role": "user", "content": "2"},
+            {
+                "role": "assistant",
+                "content": (
+                    "**Application Steps**\n\n"
+                    "1. Submit an application\n"
+                    "2. Provide transcripts\n"
+                    "3. Upload documents"
+                ),
+            },
+        ]
+        self.assertEqual(
+            _resolve_history_list_reference("answer for point 2", history),
+            "Explain these topics: Admissions requirements & application steps",
+        )
+        self.assertEqual(
+            _resolve_history_list_reference("explain step 2", history),
+            "Explain these topics: Provide transcripts",
+        )
+
+    def test_yes_does_not_attach_to_an_older_unrelated_topic(self):
+        generic_history = [
+            {"role": "user", "content": "Tell me about financial aid"},
+            {"role": "assistant", "content": "Financial aid information."},
+            {"role": "user", "content": "s"},
+            {
+                "role": "assistant",
+                "content": "Could you clarify what specific information or assistance you need?",
+            },
+        ]
+        self.assertIsNone(_resolve_history_reference("yes", generic_history))
+
+        specific_history = [{
+            "role": "assistant",
+            "content": "Are you asking about tuition payment plans?",
+        }]
+        self.assertIn(
+            "tuition payment plans",
+            _resolve_history_reference("yes", specific_history),
+        )
+
     def test_detail_request_is_contextual(self):
         self.assertTrue(_is_context_reference_query("can you be more detail"))
         self.assertTrue(_is_context_reference_query("can you answer more in detail"))

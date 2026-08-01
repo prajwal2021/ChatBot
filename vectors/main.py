@@ -63,9 +63,54 @@ def _is_low_info_query(text: str) -> bool:
     return True
 
 
+def _is_greeting_query(text: str) -> bool:
+    """Recognize a standalone social greeting without sending it to retrieval."""
+    normalized = re.sub(r"[^a-z]+", " ", (text or "").lower()).strip()
+    if not normalized:
+        return False
+    tokens = normalized.split()
+    greeting_words = {"hello", "hi", "hey", "howdy", "greetings"}
+    polite_words = {"there", "again", "everyone", "all", "good", "morning", "afternoon", "evening"}
+    return len(tokens) <= 4 and any(token in greeting_words for token in tokens) and all(
+        token in greeting_words or token in polite_words for token in tokens
+    )
+
+
+def _is_affirmation_query(text: str) -> bool:
+    normalized = re.sub(r"[^a-z]+", " ", (text or "").lower()).strip()
+    return normalized in {
+        "yes", "yes please", "yeah", "yep", "sure", "correct", "that one",
+    }
+
+
+def _numbered_reference_numbers(text: str) -> list[int]:
+    """Return list indexes only when language indicates a prior-list reference."""
+    lowered = (text or "").lower()
+    # A bare index (or compact set of indexes) is inherently contextual. It is
+    # only acted on later if the history actually contains those list items.
+    bare_indexes = re.fullmatch(
+        r"\s*#?\d{1,2}(?:\s*(?:,|&|and|also)\s*#?\d{1,2})*\s*",
+        lowered,
+    )
+    if bare_indexes:
+        return [int(value) for value in re.findall(r"\d{1,2}", lowered)]
+    has_reference_language = bool(
+        re.search(
+            r"\b(?:point|points|item|items|number|numbers|option|options|step|steps)\b|"
+            r"\b(?:talk\s*more|talk|explain|discuss|expand|cover|detail|details)\b",
+            lowered,
+        )
+    )
+    if not has_reference_language:
+        return []
+    return [int(value) for value in re.findall(r"(?<![\d.$])\b(\d{1,2})\b", lowered)]
+
+
 def _is_context_reference_query(text: str) -> bool:
     """True when a message depends on an earlier turn for its meaning."""
     t = (text or "").strip().lower()
+    if _is_affirmation_query(t) or _numbered_reference_numbers(t):
+        return True
     reference_words = r"(?:point|points|item|items|number|numbers|option|options)"
     if re.search(rf"\b{reference_words}\s*(?:#\s*)?\d+", t):
         return True
@@ -74,7 +119,8 @@ def _is_context_reference_query(text: str) -> bool:
     return bool(
         re.search(
             r"\b(this|that|these|those|them|it|the previous one|the last one|"
-            r"the above|more about|more information)\b",
+            r"the above|more about|more information|more detail|more details|"
+            r"in detail|elaborate|expand on|go deeper|continue)\b",
             t,
         )
     )
@@ -99,6 +145,7 @@ def _has_direct_information_signal(text: str) -> bool:
         "cannot", "doesnt", "everything", "for", "help", "i", "information",
         "is", "issue", "it", "me", "more", "my", "need", "not", "of", "on",
         "or", "please", "problem", "question",
+        "break", "flag", "hello", "hi", "hey", "yes", "yeah", "yep",
         "something", "stuff", "tell", "that", "the", "these", "thing", "this",
         "to", "want", "what", "when", "where", "which", "who", "why", "with",
         "work", "working", "would", "you",
@@ -107,7 +154,11 @@ def _has_direct_information_signal(text: str) -> bool:
     return bool(meaningful)
 
 
-def _list_items_from_assistant_message(content: str) -> dict[int, str]:
+def _list_items_from_assistant_message(
+    content: str,
+    *,
+    allow_bullets: bool = True,
+) -> dict[int, str]:
     """Extract the top-level numbered or bulleted list from an assistant turn."""
     numbered: dict[int, str] = {}
     bullets: list[tuple[int, str]] = []
@@ -128,7 +179,7 @@ def _list_items_from_assistant_message(content: str) -> dict[int, str]:
 
     if numbered:
         return numbered
-    if not bullets:
+    if not allow_bullets or not bullets:
         return {}
 
     min_indent = min(indent for indent, _ in bullets)
@@ -146,17 +197,10 @@ def _resolve_history_list_reference(message: str, history: list[dict]) -> str | 
     if not _is_context_reference_query(message) and not all_previous_items:
         return None
 
-    lowered = (message or "").lower()
-    numbers: list[int] = []
-    if re.search(r"\b(?:point|points|item|items|number|numbers|option|options)\b", lowered):
-        numbers = [int(n) for n in re.findall(r"\d+", lowered)]
-    else:
-        bare = re.search(
-            r"\b(?:talk about|explain|discuss|cover|tell me about)\s+(?:#\s*)?(\d+)\b",
-            lowered,
-        )
-        if bare:
-            numbers = [int(bare.group(1))]
+    numbers = _numbered_reference_numbers(message)
+    lowered_message = (message or "").lower()
+    asks_for_step = bool(re.search(r"\bsteps?\b", lowered_message))
+    asks_for_point = bool(re.search(r"\b(?:points?|items?|options?)\b", lowered_message))
 
     if not numbers and not all_previous_items:
         return None
@@ -164,7 +208,28 @@ def _resolve_history_list_reference(message: str, history: list[dict]) -> str | 
     for turn in reversed(history):
         if turn.get("role") != "assistant":
             continue
-        items = _list_items_from_assistant_message(turn.get("content", ""))
+        content = turn.get("content", "")
+        # Respect the label the assistant displayed. A later numbered block
+        # explicitly introduced as steps must not hijack "point 2" from an
+        # earlier topic/options list. Users can still request "step 2".
+        procedural_list = bool(
+            re.search(
+                r"(?im)^(?:"
+                r"#{1,4}\s+[^\n]{0,80}\b(?:steps?|procedure|instructions?)\b[^\n]*|"
+                r"(?:\*\*|__)[^\n]{0,80}\b(?:steps?|procedure|instructions?)\b"
+                r"[^\n]*(?:\*\*|__)"
+                r")\s*$",
+                content,
+            )
+        )
+        if asks_for_point and procedural_list and not asks_for_step:
+            continue
+        # A numeric reference must resolve only against numbers the user
+        # actually saw. Do not silently assign indexes to ordinary bullets.
+        items = _list_items_from_assistant_message(
+            content,
+            allow_bullets=not bool(numbers),
+        )
         if all_previous_items and items:
             return "Explain all of these topics: " + "; ".join(items.values())
         selected = [items[n] for n in numbers if n in items]
@@ -176,27 +241,42 @@ def _resolve_history_list_reference(message: str, history: list[dict]) -> str | 
 def _latest_history_subject(history: list[dict]) -> str | None:
     """Return a concise subject from the most recent substantive exchange."""
     latest_user = ""
-    latest_heading = ""
+    latest_headings: list[str] = []
     for turn in reversed(history):
         content = (turn.get("content") or "").strip()
         if not content:
             continue
-        if turn.get("role") == "assistant" and not latest_heading:
+        if turn.get("role") == "assistant" and not latest_headings:
+            # Preserve every top-level section from the most recent answer.
+            # A follow-up asking for "more detail" after three selected topics
+            # must not silently collapse to the first heading.
             for line in content.splitlines():
-                clean = re.sub(r"^[#>*_\-\s]+|[*_\s]+$", "", line).strip()
-                if 3 <= len(clean) <= 140:
-                    latest_heading = clean
+                stripped = line.strip()
+                is_markdown_heading = bool(
+                    re.match(r"^#{1,4}\s+\S", stripped)
+                    or re.match(r"^(?:\*\*|__)[^*_].*(?:\*\*|__)$", stripped)
+                )
+                if not is_markdown_heading:
+                    continue
+                clean = re.sub(r"^#{1,4}\s+|^(?:\*\*|__)|(?:\*\*|__)$", "", stripped).strip()
+                if 3 <= len(clean) <= 140 and clean not in latest_headings:
+                    latest_headings.append(clean)
+                if len(latest_headings) >= 6:
                     break
+            if not latest_headings:
+                first = next((line.strip() for line in content.splitlines() if line.strip()), "")
+                clean = re.sub(r"^[#>*_\-\s]+|[*_\s]+$", "", first).strip()
+                if 3 <= len(clean) <= 140:
+                    latest_headings.append(clean)
         elif turn.get("role") == "user" and not latest_user:
             if _has_direct_information_signal(content):
                 latest_user = content[:240]
-        if latest_heading and latest_user:
+        if latest_headings and latest_user:
             break
 
-    parts = []
-    if latest_heading:
-        parts.append(latest_heading)
-    if latest_user and latest_user.lower() not in latest_heading.lower():
+    parts = list(latest_headings)
+    headings_text = "; ".join(latest_headings)
+    if latest_user and latest_user.lower() not in headings_text.lower():
         parts.append(latest_user)
     return "; ".join(parts) or None
 
@@ -209,6 +289,21 @@ def _resolve_history_reference(message: str, history: list[dict]) -> str | None:
     if list_reference:
         return list_reference
     if not _is_context_reference_query(message):
+        return None
+    if _is_affirmation_query(message):
+        latest_assistant = next(
+            (
+                (turn.get("content") or "").strip()
+                for turn in reversed(history)
+                if turn.get("role") == "assistant" and (turn.get("content") or "").strip()
+            ),
+            "",
+        )
+        # "Yes" is useful only when it answers the immediately preceding
+        # assistant question and that question contains a concrete subject.
+        # Never reach farther back and attach it to an unrelated old topic.
+        if "?" in latest_assistant and _has_specific_information_subject(latest_assistant):
+            return f"The user answered yes to this question: {latest_assistant}"
         return None
     subject = _latest_history_subject(history)
     if not subject:
@@ -614,9 +709,9 @@ def _is_topics_query(message: str) -> bool:
         r"\bcapabilit(?:y|ies)\b",
         # Allow natural filler words: "all the topics", "main topics you
         # can help me with", and "topics you can answer about".
-        r"\b(?:topics?|subjects?|areas?)\b.{0,45}\b(?:help|answer|cover|available)\b",
-        r"\b(?:help|answer|cover)\b.{0,45}\b(?:topics?|subjects?|areas?)\b",
-        r"\b(?:all|main|major|available)\b(?:\s+\w+){0,3}\s+topics?\b",
+        r"\b(?:topics?|subjects?|areas?|sections?)\b.{0,45}\b(?:help|answer|cover|available)\b",
+        r"\b(?:help|answer|cover)\b.{0,45}\b(?:topics?|subjects?|areas?|sections?)\b",
+        r"\b(?:all|main|major|available)\b(?:\s+\w+){0,3}\s+(?:topics?|sections?)\b",
     ]
     return any(re.search(pattern, normalized) for pattern in direct_patterns)
 
@@ -641,6 +736,25 @@ def _is_topics_followup(message: str, history: list[dict]) -> bool:
         if turn.get("role") == "user" and _is_topics_query(content):
             return True
     return False
+
+
+def _has_specific_information_subject(message: str) -> bool:
+    """Distinguish a concrete information request from a bot-coverage request.
+
+    This vocabulary describes information types shared by the two assistants;
+    it does not enumerate user phrasings. It safeguards semantic routing when a
+    request contains words such as "answer" but is actually asking for data.
+    """
+    return bool(
+        re.search(
+            r"\b(?:programs?|degrees?|ph\.?d\.?|doctoral|doctorate|bachelors?|masters?|"
+            r"admissions?|applications?|deadlines?|start dates?|calendar|tuition|fees?|"
+            r"costs?|prices?|transfer credits?|prerequisites?|registration|financial aid|"
+            r"certificates?|courses?|phone|telephone|email|contact|office hours?|"
+            r"enrollment|exam|webcam|microphone|technical support|portal)\b",
+            (message or "").lower(),
+        )
+    )
 
 
 def _requested_topic_count(message: str, available: int) -> int:
@@ -702,6 +816,14 @@ def _major_topics_for_agent(agent_name: str) -> list[str]:
         "Answer questions that appear in the indexed documents",
         "Provide contact info and next steps when available",
     ]
+
+
+def _topic_response_for_agent(agent_name: str, message: str) -> str:
+    topics = _major_topics_for_agent(agent_name)
+    topics = topics[:_requested_topic_count(message, len(topics))]
+    return "**Major topics I can help with**\n\n" + "\n".join(
+        f"{index}. {topic}" for index, topic in enumerate(topics, start=1)
+    )
 
 
 def _list_kb_topics(collection: str, min_repeats: int = 2) -> dict[str, list[str]]:
@@ -940,15 +1062,27 @@ async def chat(agent_name: str, req: ChatRequest, request: Request):
             history_dicts.append({"role": "user",      "content": turn["query"]})
             history_dicts.append({"role": "assistant",  "content": turn["response"]})
 
+    # Social greetings are conversational turns, not knowledge-base searches.
+    # Keeping them out of retrieval prevents arbitrary nearest chunks from
+    # leaking into a welcome response.
+    if _is_greeting_query(req.message):
+        label = AGENTS[agent_name].get("display_name", agent_name)
+        greeting_response = (
+            f"Hello! I can help with questions about {label}, including programs, "
+            "admissions, costs, courses, policies, and student support. What would you like to know?"
+        )
+
+        async def greeting_stream():
+            yield greeting_response
+            add_turn(session_id, req.message, greeting_response)
+
+        return StreamingResponse(greeting_stream(), media_type="text/plain; charset=utf-8")
+
     # "What topics can you cover?" — answer directly from the configured
     # capability map so it cannot be rejected by probabilistic scope routing.
     # Also preserve that subject for follow-ups such as "give me a list of all".
     if _is_topics_query(req.message) or _is_topics_followup(req.message, history_dicts):
-        topics = _major_topics_for_agent(agent_name)
-        topics = topics[:_requested_topic_count(req.message, len(topics))]
-        topic_response = "**Major topics I can help with**\n\n" + "\n".join(
-            f"{i}. {topic}" for i, topic in enumerate(topics, start=1)
-        )
+        topic_response = _topic_response_for_agent(agent_name, req.message)
 
         async def topics_stream():
             yield topic_response
@@ -971,20 +1105,11 @@ async def chat(agent_name: str, req: ChatRequest, request: Request):
     # One- or two-word fragments without a conversational referent are not safe
     # retrieval queries. Use nearby KB material only to formulate a useful,
     # dynamic clarification question; never answer from an arbitrary top hit.
-    if (
-        _is_low_info_query(req.message)
-        or not _has_direct_information_signal(req.message)
-    ) and not reference_query:
-        candidate_chunks: list[dict] = []
-        try:
-            candidate_chunks = _search_collection(collection, req.message, top_k=3)
-        except Exception:
-            pass
+    if not _has_direct_information_signal(req.message) and not reference_query:
         clarification = await generate_clarification(
             req.message,
             guardrails=guardrails,
             history=history_dicts,
-            chunks=candidate_chunks,
         )
 
         async def low_info_clarification_stream():
@@ -1037,6 +1162,28 @@ async def chat(agent_name: str, req: ChatRequest, request: Request):
             "clarification_question": "",
             "error": intent.get("error", ""),
         }
+
+    # Semantic capability classification handles paraphrases that the fast
+    # deterministic detector has never seen.
+    if intent["action"] == "capabilities":
+        # A semantic classifier can confuse "programs you answer questions
+        # about" or "contact information" with a request for the chatbot's
+        # general menu. Concrete information subjects always go to retrieval.
+        if _has_specific_information_subject(req.message):
+            intent = {
+                "action": "search_broad",
+                "rewritten_query": req.message,
+                "clarification_question": "",
+                "error": "",
+            }
+        else:
+            topic_response = _topic_response_for_agent(agent_name, req.message)
+
+            async def semantic_topics_stream():
+                yield topic_response
+                add_turn(session_id, req.message, topic_response)
+
+            return StreamingResponse(semantic_topics_stream(), media_type="text/plain; charset=utf-8")
 
     if intent["action"] == "clarify":
         # A broad but identifiable subject should be answered from all available
