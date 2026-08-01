@@ -7,6 +7,8 @@ from llm import _sanitize_output, get_answer_models
 from main import (
     _cross_agent_referral,
     _expand_queries,
+    _is_topics_followup,
+    _is_topics_query,
     _matches_current_agent_scope,
     _persistent_user_context,
     _resolve_history_reference,
@@ -15,6 +17,32 @@ from main import (
 
 
 class ConversationReferenceTests(unittest.TestCase):
+    def test_natural_capability_questions_are_recognized(self):
+        questions = [
+            "can you tell me all the topics you can answer about",
+            "what are the main topics you can help me with?",
+            "what can you help me with",
+        ]
+        for question in questions:
+            with self.subTest(question=question):
+                self.assertTrue(_is_topics_query(question))
+
+    def test_list_all_keeps_capability_subject_from_history(self):
+        history = [
+            {"role": "user", "content": "what can you help me with"},
+            {
+                "role": "assistant",
+                "content": "**Major topics I can help with**\n\n1. Programs\n2. Fees",
+            },
+        ]
+        self.assertTrue(_is_topics_followup("can you give list of all", history))
+        self.assertFalse(
+            _is_topics_followup(
+                "can you give list of all",
+                [{"role": "assistant", "content": "Tuition is listed by program."}],
+            )
+        )
+
     def test_numbered_markdown_reference_resolves_exact_items(self):
         history = [{
             "role": "assistant",

@@ -606,21 +606,41 @@ def _is_topics_query(message: str) -> bool:
     m = (message or "").strip().lower()
     if not m:
         return False
-    triggers = [
-        "all major topics",
-        "all topics",
-        "major topics",
-        "topics available",
-        "what topics",
-        "what can you help with",
-        "what can you do",
-        "what do you cover",
-        "what questions can i ask",
-        "capabilities",
-        "areas you can help",
-        "areas can you help",
+    normalized = re.sub(r"[^a-z0-9]+", " ", m).strip()
+    direct_patterns = [
+        r"\bwhat\s+can\s+you\s+(?:help|answer|do|cover)\b",
+        r"\bwhat\s+(?:questions?|topics?|subjects?|areas?)\s+can\s+i\s+ask\b",
+        r"\bwhat\s+do\s+you\s+cover\b",
+        r"\bcapabilit(?:y|ies)\b",
+        # Allow natural filler words: "all the topics", "main topics you
+        # can help me with", and "topics you can answer about".
+        r"\b(?:topics?|subjects?|areas?)\b.{0,45}\b(?:help|answer|cover|available)\b",
+        r"\b(?:help|answer|cover)\b.{0,45}\b(?:topics?|subjects?|areas?)\b",
+        r"\b(?:all|main|major|available)\b(?:\s+\w+){0,3}\s+topics?\b",
     ]
-    return any(t in m for t in triggers)
+    return any(re.search(pattern, normalized) for pattern in direct_patterns)
+
+
+def _is_topics_followup(message: str, history: list[dict]) -> bool:
+    """Resolve an exhaustive follow-up to an earlier capability request.
+
+    This deliberately requires a capability-related prior turn, so a generic
+    "list all" after a tuition or program answer keeps its original subject.
+    """
+    if not _requests_exhaustive_answer(message):
+        return False
+    for turn in reversed(history[-6:]):
+        content = (turn.get("content") or "").strip()
+        if not content:
+            continue
+        if turn.get("role") == "assistant" and re.search(
+            r"\bmajor\s+topics?\s+i\s+can\s+help\s+with\b",
+            re.sub(r"[^a-z0-9]+", " ", content.lower()),
+        ):
+            return True
+        if turn.get("role") == "user" and _is_topics_query(content):
+            return True
+    return False
 
 
 def _requested_topic_count(message: str, available: int) -> int:
@@ -911,9 +931,19 @@ async def chat(agent_name: str, req: ChatRequest, request: Request):
             yield crisis_msg
         return StreamingResponse(crisis_stream(), media_type="text/plain; charset=utf-8")
 
-    # "What topics can you cover?" — answer from the KB index directly so the
-    # response is complete (not limited by retrieval top_k).
-    if _is_topics_query(req.message):
+    # Use the conversation history supplied by the frontend. Keep Redis as a
+    # fallback for existing API clients that use a stable session_id.
+    history_dicts = [turn.model_dump() for turn in req.history]
+    if not history_dicts:
+        session_turns = get_history(session_id)
+        for turn in session_turns:
+            history_dicts.append({"role": "user",      "content": turn["query"]})
+            history_dicts.append({"role": "assistant",  "content": turn["response"]})
+
+    # "What topics can you cover?" — answer directly from the configured
+    # capability map so it cannot be rejected by probabilistic scope routing.
+    # Also preserve that subject for follow-ups such as "give me a list of all".
+    if _is_topics_query(req.message) or _is_topics_followup(req.message, history_dicts):
         topics = _major_topics_for_agent(agent_name)
         topics = topics[:_requested_topic_count(req.message, len(topics))]
         topic_response = "**Major topics I can help with**\n\n" + "\n".join(
@@ -925,15 +955,6 @@ async def chat(agent_name: str, req: ChatRequest, request: Request):
             add_turn(session_id, req.message, topic_response)
 
         return StreamingResponse(topics_stream(), media_type="text/plain; charset=utf-8")
-
-    # Use the conversation history supplied by the frontend. Keep Redis as a
-    # fallback for existing API clients that use a stable session_id.
-    history_dicts = [turn.model_dump() for turn in req.history]
-    if not history_dicts:
-        session_turns = get_history(session_id)
-        for turn in session_turns:
-            history_dicts.append({"role": "user",      "content": turn["query"]})
-            history_dicts.append({"role": "assistant",  "content": turn["response"]})
 
     guardrails = AGENTS[agent_name].get("guardrails", "")
     route_response = _cross_agent_referral(agent_name, req.message)
