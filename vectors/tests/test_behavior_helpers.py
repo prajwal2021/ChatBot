@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import unittest
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 from ingest import chunk_text_with_sections
-from llm import _sanitize_output, get_answer_models
+from llm import _sanitize_output, get_answer_models, resolve_intent
 from main import (
     _cross_agent_referral,
     _expand_queries,
@@ -15,10 +17,61 @@ from main import (
     _is_topics_query,
     _latest_history_subject,
     _matches_current_agent_scope,
+    _out_of_scope_response,
     _persistent_user_context,
     _resolve_history_reference,
     _resolve_history_list_reference,
+    _topic_menu_cache,
+    _topic_response_for_agent,
 )
+
+
+class SocialIntentTests(unittest.IsolatedAsyncioTestCase):
+    async def test_social_reply_is_returned_without_reusing_prior_menu(self):
+        response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=(
+                '{"action":"social","rewritten_query":"",'
+                '"clarification_question":"",'
+                '"social_response":"You’re welcome! I’m glad I could help."}'
+            )))]
+        )
+        with patch("llm._client.chat.completions.create", new=AsyncMock(return_value=response)):
+            intent = await resolve_intent(
+                "thank you, you are helpful",
+                history=[{
+                    "role": "assistant",
+                    "content": "**Major topics I can help with**\n\n1. Programs\n2. Registration",
+                }],
+            )
+
+        self.assertEqual(intent["action"], "social")
+        self.assertIn("welcome", intent["social_response"].lower())
+        self.assertNotIn("Major topics", intent["social_response"])
+
+    def test_out_of_scope_boundary_is_friendly(self):
+        response = _out_of_scope_response("online_chat", "How do I repair a car?")
+        self.assertIn("TTU Online", response)
+        self.assertNotIn("outside the scope", response.lower())
+        self.assertNotIn("appropriate trusted resource", response.lower())
+
+    async def test_capability_menu_is_derived_from_indexed_headings(self):
+        generated = [f"Indexed topic {index}" for index in range(1, 13)]
+        _topic_menu_cache.clear()
+        with (
+            patch("main._list_kb_topics", return_value={
+                "guide.docx": ["Enrollment", "Credit by Exams", "Graduation"],
+            }),
+            patch(
+                "main.generate_capability_topics",
+                new=AsyncMock(return_value=generated),
+            ) as generator,
+        ):
+            response = await _topic_response_for_agent("k12_chat", "What can you help with?")
+
+        self.assertIn("12. Indexed topic 12", response)
+        headings = generator.await_args.args[0]
+        self.assertIn("Credit by Exams", headings)
+        _topic_menu_cache.clear()
 
 
 class ConversationReferenceTests(unittest.TestCase):

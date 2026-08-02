@@ -18,6 +18,8 @@ function generateId() {
 
 // Display names for greeting text — keyed by agent ID
 const AGENT_DISPLAY: Record<string, string> = {
+  "ttu-online": "TTU Online",
+  "k12": "K-12",
   "online_chat": "TTU Online",
   "k12_chat": "K-12",
 };
@@ -139,7 +141,7 @@ export default function AgentChatPage() {
     const name = AGENT_DISPLAY[agentId] ?? agentId;
     const msg1Id = generateId();
     const msg2Id = generateId();
-    const fullText = `I'm your ChatBot and I contain information on ${name}. How can I help you today?`;
+    const fullText = `I'm your ${name} assistant. How can I help you today?`;
 
     let aborted = false;
 

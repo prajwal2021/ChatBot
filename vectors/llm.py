@@ -178,6 +178,15 @@ def _is_model_fallback_error(e: Exception) -> bool:
 _INTENT_SYSTEM_PROMPT = """You route messages for a retrieval-based university chatbot.
 Decide whether the user's intent is clear enough to search the knowledge base.
 
+Return social when the latest message is purely conversational, such as a
+greeting, thanks, a polite acknowledgment, a farewell, or a question about how
+the assistant is doing. A social message may follow a substantive answer; do
+not repeat that answer or a capabilities menu merely because it appears in the
+history. If the message also contains a substantive university question,
+classify the substantive request instead. For social, write one brief, warm,
+natural reply that offers further help when appropriate and makes no factual
+claims about university programs.
+
 Return capabilities when the user is asking what this assistant knows, what it
 can answer, what kinds of help are available, or requests a menu/list of its
 coverage. Classify by meaning rather than requiring particular words.
@@ -200,9 +209,10 @@ the conversation, return out_of_scope. Do not classify vague or contextual
 follow-ups as out_of_scope.
 
 Return JSON only with these keys:
-{"action":"search | clarify | capabilities | out_of_scope", "rewritten_query":"...", "clarification_question":"..."}
+{"action":"search | clarify | capabilities | social | out_of_scope", "rewritten_query":"...", "clarification_question":"...", "social_response":"..."}
 For search, clarification_question must be empty. For clarify, rewritten_query
-may be empty. For capabilities or out_of_scope, both text fields must be empty."""
+may be empty. For social, social_response must contain the reply. For
+capabilities or out_of_scope, all text fields must be empty."""
 
 
 def _history_messages(history: list[dict] | None) -> list[dict]:
@@ -262,6 +272,7 @@ async def resolve_intent(
             action = str(parsed.get("action", "")).strip().lower()
             rewritten = str(parsed.get("rewritten_query", "")).strip()
             clarification = str(parsed.get("clarification_question", "")).strip()
+            social_response = str(parsed.get("social_response", "")).strip()
 
             if action == "clarify" and clarification:
                 return {
@@ -291,6 +302,14 @@ async def resolve_intent(
                     "clarification_question": "",
                     "error": "",
                 }
+            if action == "social" and social_response:
+                return {
+                    "action": "social",
+                    "rewritten_query": "",
+                    "clarification_question": "",
+                    "social_response": social_response,
+                    "error": "",
+                }
             analyzer_error = "invalid_response"
         except Exception as e:
             analyzer_error = type(e).__name__
@@ -304,6 +323,69 @@ async def resolve_intent(
         "clarification_question": "",
         "error": analyzer_error,
     }
+
+
+async def generate_capability_topics(
+    headings: list[str],
+    *,
+    assistant_name: str,
+) -> list[str]:
+    """Group indexed document headings into a user-facing capability menu."""
+    if not headings:
+        return []
+
+    unique: list[str] = []
+    seen: set[str] = set()
+    total_chars = 0
+    for heading in headings:
+        clean = re.sub(r"\s+", " ", (heading or "").strip())
+        key = clean.lower()
+        if not clean or key in seen:
+            continue
+        if total_chars + len(clean) > 24_000:
+            break
+        seen.add(key)
+        unique.append(clean)
+        total_chars += len(clean)
+
+    system = f"""Create a capability menu for the {assistant_name} assistant from
+document headings taken directly from its current knowledge-base index.
+
+Group the headings into 10 to 16 distinct, high-level topics that a parent,
+student, or counselor would recognize. Cover the breadth of the headings, merge
+duplicates, and omit document artifacts, addresses, names, and overly narrow
+questions. Use concise noun phrases. Do not add a topic unless at least one
+heading supports it. Return JSON only as {{"topics":["...", "..."]}}."""
+
+    for model_name in get_utility_models():
+        try:
+            response = await _client.chat.completions.create(
+                model=model_name,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": "Indexed headings:\n- " + "\n- ".join(unique)},
+                ],
+                temperature=0.1,
+                max_completion_tokens=700,
+                response_format={"type": "json_object"},
+            )
+            content = response.choices[0].message.content if response.choices else ""
+            parsed = _parse_json_object(content or "")
+            topics = parsed.get("topics", [])
+            if not isinstance(topics, list):
+                continue
+            cleaned = [
+                re.sub(r"\s+", " ", topic).strip(" -")
+                for topic in topics
+                if isinstance(topic, str) and topic.strip()
+            ]
+            if len(cleaned) >= 6:
+                return cleaned[:16]
+        except Exception as e:
+            if _is_quota_error(e) or _is_model_fallback_error(e):
+                continue
+            break
+    return []
 
 
 async def generate_clarification(

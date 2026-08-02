@@ -25,19 +25,19 @@ it in a URL or browser source code.
 Authorization: Bearer YOUR_LOG_EXPORT_API_KEY
 ```
 
-The public agent IDs are `k12_chat` and `online_chat`. The legacy chat route
-IDs `k12`, `ttu-online`, and `ttu_online` remain accepted by the backend.
+The public agent IDs are `k12` and `ttu-online`. The aliases `k12_chat`,
+`online_chat`, and `ttu_online` remain accepted by the backend.
 
 ## Historical records
 
 ```http
-GET /api/v1/logs?agent=k12_chat&limit=100
+GET /api/v1/logs?agent=k12&limit=100
 Authorization: Bearer YOUR_LOG_EXPORT_API_KEY
 ```
 
 Supported query parameters:
 
-- `agent`: `k12_chat` or `online_chat` (optional)
+- `agent`: `k12` or `ttu-online` (aliases are also accepted; optional)
 - `since`: ISO-8601 timestamp, inclusive (optional)
 - `until`: ISO-8601 timestamp, inclusive (optional)
 - `limit`: 1-1000, default 100
@@ -68,7 +68,7 @@ headers = {"Authorization": f"Bearer {os.environ['CHATBOT_LOG_API_KEY']}"}
 cursor = None
 
 while True:
-    params = {"agent": "k12_chat", "limit": 500}
+    params = {"agent": "k12", "limit": 500}
     if cursor:
         params["cursor"] = cursor
     response = requests.get(
@@ -89,7 +89,7 @@ while True:
 ## Live records
 
 ```http
-GET /api/v1/logs/stream?agent=online_chat
+GET /api/v1/logs/stream?agent=ttu-online
 Authorization: Bearer YOUR_LOG_EXPORT_API_KEY
 Accept: text/event-stream
 ```

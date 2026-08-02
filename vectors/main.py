@@ -22,7 +22,13 @@ from agent_ids import canonical_agent_id
 from embeddings import embed, embed_batch, sparse_embed, sparse_embed_batch
 from qdrant_store import get_client
 from ingest import download_sharepoint, run_ingestion_from_bytes, ingest_to_collection  # noqa: F401
-from llm import generate_clarification, get_answer_models, resolve_intent, stream_answer
+from llm import (
+    generate_capability_topics,
+    generate_clarification,
+    get_answer_models,
+    resolve_intent,
+    stream_answer,
+)
 from logger import log_interaction, log_error
 from evaluator import evaluate_response, is_crisis_query
 from cache import get_cached_response, store_cached_response
@@ -365,7 +371,7 @@ def _matches_current_agent_scope(agent_name: str, message: str) -> bool:
 
 
 def _out_of_scope_response(agent_name: str, message: str) -> str:
-    """Return a concise boundary with an appropriate non-chatbot referral."""
+    """Return a friendly boundary with an appropriate referral."""
     agent_name = canonical_agent_id(agent_name)
     label = AGENTS.get(agent_name, {}).get("display_name", agent_name)
     lowered = (message or "").lower()
@@ -376,8 +382,8 @@ def _out_of_scope_response(agent_name: str, message: str) -> str:
     elif re.search(r"\b(invest|tax|stock|financial advice)\b", lowered):
         referral = "Please consult a qualified financial professional."
     else:
-        referral = "Please use an appropriate trusted resource for that topic."
-    return f"That topic is outside the scope of {label}. {referral}"
+        referral = "A trusted resource on that subject will be better able to help."
+    return f"I’m here to help with {label} questions, so I can’t reliably answer that one. {referral}"
 
 # When false, the backend will not emit the UI image protocol (__IMAGES__) even if
 # image_ids exist in Qdrant payloads.
@@ -411,6 +417,7 @@ def _save_kb_hashes(hashes: dict[str, str]) -> None:
 
 
 _kb_hashes: dict[str, str] = _load_kb_hashes()
+_topic_menu_cache: dict[str, list[str]] = {}
 
 
 async def _check_agent(agent_id: str, cfg: dict) -> None:
@@ -426,6 +433,7 @@ async def _check_agent(agent_id: str, cfg: dict) -> None:
             return
         logger.info(f"KB watcher [{agent_id}]: change detected in {filename}, re-ingesting...")
         count = run_ingestion_from_bytes(data, filename, cfg["collection"], full=True)
+        _topic_menu_cache.pop(agent_id, None)
         _kb_hashes[agent_id] = current_hash
         _save_kb_hashes(_kb_hashes)
         logger.info(f"KB watcher [{agent_id}]: indexed {count} chunks into '{cfg['collection']}'")
@@ -806,7 +814,7 @@ def _extract_topic_candidates(text: str) -> str | None:
 
 def _major_topics_for_agent(agent_name: str) -> list[str]:
     agent_name = canonical_agent_id(agent_name)
-    if agent_name == "online_chat":
+    if agent_name == "ttu-online":
         return [
             "Programs & degrees offered (undergrad/grad)",
             "Admissions requirements & application steps",
@@ -818,12 +826,24 @@ def _major_topics_for_agent(agent_name: str) -> list[str]:
             "Industry Career Certificates",
             "Contact info, office hours, and support resources",
         ]
-    if agent_name == "k12_chat":
+    if agent_name == "k12":
         return [
-            "Program overview and enrollment basics",
-            "Courses, pacing, and academic policies",
-            "Tuition/fees and payment guidance",
-            "Support contacts and common troubleshooting steps",
+            "Full-time tuition-free, tuition-paid, and supplemental programs",
+            "Elementary, middle, and high school options",
+            "Admissions, eligibility, applications, and enrollment",
+            "Courses, curriculum, pacing, extensions, and transfers",
+            "Credit by Examination (CBE)",
+            "Advanced Placement and dual credit",
+            "Tuition, fees, payments, and refunds",
+            "Grades, progress reports, and grade appeals",
+            "Attendance, calendars, and state assessments",
+            "Graduation, diplomas, and transcripts",
+            "Focus, Parent, Counselor, and Canvas portals",
+            "Exams, Proctorio, and technology requirements",
+            "Accommodations and support for students with disabilities",
+            "Textbooks, purchasing, and shipping",
+            "Counselor, school, district, and institutional services",
+            "Forms, contacts, and student support",
         ]
     return [
         "Answer questions that appear in the indexed documents",
@@ -831,8 +851,28 @@ def _major_topics_for_agent(agent_name: str) -> list[str]:
     ]
 
 
-def _topic_response_for_agent(agent_name: str, message: str) -> str:
-    topics = _major_topics_for_agent(agent_name)
+async def _topic_response_for_agent(agent_name: str, message: str) -> str:
+    agent_name = canonical_agent_id(agent_name)
+    topics = _topic_menu_cache.get(agent_name, [])
+    if not topics:
+        cfg = AGENTS.get(agent_name, {})
+        try:
+            topics_by_source = _list_kb_topics(cfg.get("collection", ""), min_repeats=1)
+            headings = [
+                topic
+                for source_topics in topics_by_source.values()
+                for topic in source_topics
+            ]
+            topics = await generate_capability_topics(
+                headings,
+                assistant_name=cfg.get("display_name", agent_name),
+            )
+        except Exception as exc:
+            logger.warning("Could not build indexed topic menu for %s: %s", agent_name, exc)
+        if topics:
+            _topic_menu_cache[agent_name] = topics
+        else:
+            topics = _major_topics_for_agent(agent_name)
     topics = topics[:_requested_topic_count(message, len(topics))]
     return "**Major topics I can help with**\n\n" + "\n".join(
         f"{index}. {topic}" for index, topic in enumerate(topics, start=1)
@@ -968,6 +1008,7 @@ def _run_ingest_job(agent_id: str, url: str) -> None:
         data, filename = download_sharepoint(url)
         _ingest_status = {"state": "running", "detail": f"[{agent_id}] Embedding {filename}..."}
         count = run_ingestion_from_bytes(data, filename, collection, full=True)
+        _topic_menu_cache.pop(agent_id, None)
         _ingest_status = {"state": "done", "detail": f"[{agent_id}] Indexed {count} chunks from {filename}"}
     except Exception as e:
         _ingest_status = {"state": "error", "detail": str(e)}
@@ -1131,7 +1172,7 @@ async def chat(agent_name: str, req: ChatRequest, request: Request):
     # capability map so it cannot be rejected by probabilistic scope routing.
     # Also preserve that subject for follow-ups such as "give me a list of all".
     if _is_topics_query(req.message) or _is_topics_followup(req.message, history_dicts):
-        topic_response = _topic_response_for_agent(agent_name, req.message)
+        topic_response = await _topic_response_for_agent(agent_name, req.message)
 
         return completed_text_response(topic_response, source="topics")
 
@@ -1142,18 +1183,6 @@ async def chat(agent_name: str, req: ChatRequest, request: Request):
 
     reference_query = _resolve_history_reference(req.message, history_dicts)
     persistent_context = _persistent_user_context(history_dicts)
-
-    # One- or two-word fragments without a conversational referent are not safe
-    # retrieval queries. Use nearby KB material only to formulate a useful,
-    # dynamic clarification question; never answer from an arbitrary top hit.
-    if not _has_direct_information_signal(req.message) and not reference_query:
-        clarification = await generate_clarification(
-            req.message,
-            guardrails=guardrails,
-            history=history_dicts,
-        )
-
-        return completed_text_response(clarification, source="clarification")
 
     if reference_query:
         intent = {
@@ -1168,6 +1197,13 @@ async def chat(agent_name: str, req: ChatRequest, request: Request):
             guardrails=guardrails,
             history=history_dicts,
         )
+
+    # Courtesy, acknowledgments, and other lightweight conversation should not
+    # enter retrieval or inherit an unrelated intent from the previous answer.
+    if intent["action"] == "social":
+        social_response = intent.get("social_response", "").strip()
+        if social_response:
+            return completed_text_response(social_response, source="social")
 
     if intent["action"] == "unavailable":
         print(
@@ -1204,7 +1240,7 @@ async def chat(agent_name: str, req: ChatRequest, request: Request):
                 "error": "",
             }
         else:
-            topic_response = _topic_response_for_agent(agent_name, req.message)
+            topic_response = await _topic_response_for_agent(agent_name, req.message)
 
             return completed_text_response(topic_response, source="topics")
 
