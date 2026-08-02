@@ -18,6 +18,7 @@ from pydantic import BaseModel
 from qdrant_client.models import FusionQuery, Fusion, Prefetch, SparseVector
 
 from agents_config import AGENTS
+from agent_ids import canonical_agent_id
 from embeddings import embed, embed_batch, sparse_embed, sparse_embed_batch
 from qdrant_store import get_client
 from ingest import download_sharepoint, run_ingestion_from_bytes, ingest_to_collection  # noqa: F401
@@ -27,6 +28,7 @@ from evaluator import evaluate_response, is_crisis_query
 from cache import get_cached_response, store_cached_response
 from session import get_history, add_turn
 from ratelimit import is_rate_limited
+from log_export import router as log_export_router
 
 logger = logging.getLogger("kb_watcher")
 
@@ -336,6 +338,7 @@ def _persistent_user_context(history: list[dict]) -> list[str]:
 
 def _cross_agent_referral(agent_name: str, message: str) -> str | None:
     """Route explicit questions for another configured TTU assistant."""
+    agent_name = canonical_agent_id(agent_name)
     current = AGENTS.get(agent_name, {})
     lowered = (message or "").lower()
     for other_name, cfg in AGENTS.items():
@@ -354,6 +357,7 @@ def _cross_agent_referral(agent_name: str, message: str) -> str | None:
 
 
 def _matches_current_agent_scope(agent_name: str, message: str) -> bool:
+    agent_name = canonical_agent_id(agent_name)
     lowered = (message or "").lower()
     cfg = AGENTS.get(agent_name, {})
     patterns = list(cfg.get("routing_terms", [])) + list(cfg.get("scope_terms", []))
@@ -362,6 +366,7 @@ def _matches_current_agent_scope(agent_name: str, message: str) -> bool:
 
 def _out_of_scope_response(agent_name: str, message: str) -> str:
     """Return a concise boundary with an appropriate non-chatbot referral."""
+    agent_name = canonical_agent_id(agent_name)
     label = AGENTS.get(agent_name, {}).get("display_name", agent_name)
     lowered = (message or "").lower()
     if re.search(r"\b(medication|medicine|dose|dosage|diagnos|symptom|medical|health)\b", lowered):
@@ -457,6 +462,11 @@ _CORS_ORIGINS = [
     "http://localhost:3000",
     "https://tosmonline0002.ttu.edu",
 ]
+_CORS_ORIGINS.extend(
+    origin.strip()
+    for origin in os.getenv("LOG_EXPORT_CORS_ORIGINS", "").split(",")
+    if origin.strip()
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -464,6 +474,8 @@ app.add_middleware(
     allow_methods=["POST", "GET"],
     allow_headers=["*"],
 )
+
+app.include_router(log_export_router)
 
 
 # ── Models ─────────────────────────────────────────────────────────────────────
@@ -793,7 +805,8 @@ def _extract_topic_candidates(text: str) -> str | None:
 
 
 def _major_topics_for_agent(agent_name: str) -> list[str]:
-    if agent_name == "ttu-online":
+    agent_name = canonical_agent_id(agent_name)
+    if agent_name == "online_chat":
         return [
             "Programs & degrees offered (undergrad/grad)",
             "Admissions requirements & application steps",
@@ -805,7 +818,7 @@ def _major_topics_for_agent(agent_name: str) -> list[str]:
             "Industry Career Certificates",
             "Contact info, office hours, and support resources",
         ]
-    if agent_name == "k12":
+    if agent_name == "k12_chat":
         return [
             "Program overview and enrollment basics",
             "Courses, pacing, and academic policies",
@@ -945,6 +958,7 @@ def list_agents():
 
 def _run_ingest_job(agent_id: str, url: str) -> None:
     global _ingest_status
+    agent_id = canonical_agent_id(agent_id)
     if agent_id not in AGENTS:
         _ingest_status = {"state": "error", "detail": f"Unknown agent: {agent_id}"}
         return
@@ -1023,6 +1037,7 @@ def get_crisis_response(query: str) -> str | None:
 
 @app.post("/chat/{agent_name}")
 async def chat(agent_name: str, req: ChatRequest, request: Request):
+    agent_name = canonical_agent_id(agent_name)
     if agent_name not in AGENTS:
         raise HTTPException(
             status_code=404,
@@ -1039,6 +1054,46 @@ async def chat(agent_name: str, req: ChatRequest, request: Request):
     t_request    = time.monotonic()
     user_ip_hash = hashlib.sha256(user_ip.encode()).hexdigest()
 
+    def completed_text_response(
+        text: str,
+        *,
+        source: str,
+        fallback_triggered: bool = False,
+        add_to_session: bool = True,
+    ) -> StreamingResponse:
+        """Stream and log a completed non-retrieval response consistently."""
+        async def completed_stream():
+            yield text
+            if add_to_session:
+                add_turn(session_id, req.message, text)
+            log_interaction(
+                session_id=session_id,
+                query_text=req.message,
+                agent=agent_name,
+                user_ip=user_ip,
+                user_agent=user_agent,
+                retrieval_result={
+                    "method": source,
+                    "chunks_retrieved": 0,
+                    "retrieval_latency_ms": 0,
+                    "chunks": [],
+                },
+                response_result={
+                    "text": text,
+                    "model_used": "cached" if source == "cache" else "none",
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "tokens_used": 0,
+                    "llm_latency_ms": 0,
+                    "total_latency_ms": int((time.monotonic() - t_request) * 1000),
+                    "fallback_triggered": fallback_triggered,
+                    "source": source,
+                },
+                eval_result=None,
+            )
+
+        return StreamingResponse(completed_stream(), media_type="text/plain; charset=utf-8")
+
     # POSITION 1 — rate limiting
     if is_rate_limited(user_ip_hash):
         raise HTTPException(
@@ -1049,9 +1104,7 @@ async def chat(agent_name: str, req: ChatRequest, request: Request):
     # Crisis interception — bypass cache and session history
     crisis_msg = get_crisis_response(req.message)
     if crisis_msg:
-        async def crisis_stream():
-            yield crisis_msg
-        return StreamingResponse(crisis_stream(), media_type="text/plain; charset=utf-8")
+        return completed_text_response(crisis_msg, source="crisis", add_to_session=False)
 
     # Use the conversation history supplied by the frontend. Keep Redis as a
     # fallback for existing API clients that use a stable session_id.
@@ -1072,11 +1125,7 @@ async def chat(agent_name: str, req: ChatRequest, request: Request):
             "admissions, costs, courses, policies, and student support. What would you like to know?"
         )
 
-        async def greeting_stream():
-            yield greeting_response
-            add_turn(session_id, req.message, greeting_response)
-
-        return StreamingResponse(greeting_stream(), media_type="text/plain; charset=utf-8")
+        return completed_text_response(greeting_response, source="greeting")
 
     # "What topics can you cover?" — answer directly from the configured
     # capability map so it cannot be rejected by probabilistic scope routing.
@@ -1084,20 +1133,12 @@ async def chat(agent_name: str, req: ChatRequest, request: Request):
     if _is_topics_query(req.message) or _is_topics_followup(req.message, history_dicts):
         topic_response = _topic_response_for_agent(agent_name, req.message)
 
-        async def topics_stream():
-            yield topic_response
-            add_turn(session_id, req.message, topic_response)
-
-        return StreamingResponse(topics_stream(), media_type="text/plain; charset=utf-8")
+        return completed_text_response(topic_response, source="topics")
 
     guardrails = AGENTS[agent_name].get("guardrails", "")
     route_response = _cross_agent_referral(agent_name, req.message)
     if route_response:
-        async def cross_agent_stream():
-            yield route_response
-            add_turn(session_id, req.message, route_response)
-
-        return StreamingResponse(cross_agent_stream(), media_type="text/plain; charset=utf-8")
+        return completed_text_response(route_response, source="cross_agent_referral")
 
     reference_query = _resolve_history_reference(req.message, history_dicts)
     persistent_context = _persistent_user_context(history_dicts)
@@ -1112,14 +1153,7 @@ async def chat(agent_name: str, req: ChatRequest, request: Request):
             history=history_dicts,
         )
 
-        async def low_info_clarification_stream():
-            yield clarification
-            add_turn(session_id, req.message, clarification)
-
-        return StreamingResponse(
-            low_info_clarification_stream(),
-            media_type="text/plain; charset=utf-8",
-        )
+        return completed_text_response(clarification, source="clarification")
 
     if reference_query:
         intent = {
@@ -1147,14 +1181,7 @@ async def chat(agent_name: str, req: ChatRequest, request: Request):
                 history=history_dicts,
             )
 
-            async def analyzer_failure_clarification_stream():
-                yield clarification
-                add_turn(session_id, req.message, clarification)
-
-            return StreamingResponse(
-                analyzer_failure_clarification_stream(),
-                media_type="text/plain; charset=utf-8",
-            )
+            return completed_text_response(clarification, source="clarification")
 
         intent = {
             "action": "search_fallback",
@@ -1179,11 +1206,7 @@ async def chat(agent_name: str, req: ChatRequest, request: Request):
         else:
             topic_response = _topic_response_for_agent(agent_name, req.message)
 
-            async def semantic_topics_stream():
-                yield topic_response
-                add_turn(session_id, req.message, topic_response)
-
-            return StreamingResponse(semantic_topics_stream(), media_type="text/plain; charset=utf-8")
+            return completed_text_response(topic_response, source="topics")
 
     if intent["action"] == "clarify":
         # A broad but identifiable subject should be answered from all available
@@ -1199,14 +1222,7 @@ async def chat(agent_name: str, req: ChatRequest, request: Request):
         else:
             clarification = intent["clarification_question"]
 
-            async def intent_clarification_stream():
-                yield clarification
-                add_turn(session_id, req.message, clarification)
-
-            return StreamingResponse(
-                intent_clarification_stream(),
-                media_type="text/plain; charset=utf-8",
-            )
+            return completed_text_response(clarification, source="clarification")
 
     if intent["action"] == "out_of_scope":
         # The probabilistic classifier cannot veto an explicit match for the
@@ -1222,11 +1238,7 @@ async def chat(agent_name: str, req: ChatRequest, request: Request):
         else:
             scope_response = _out_of_scope_response(agent_name, req.message)
 
-            async def out_of_scope_stream():
-                yield scope_response
-                add_turn(session_id, req.message, scope_response)
-
-            return StreamingResponse(out_of_scope_stream(), media_type="text/plain; charset=utf-8")
+            return completed_text_response(scope_response, source="out_of_scope")
 
     retrieval_query = intent["rewritten_query"] or req.message
     if _looks_multi_topic(req.message) and intent["action"] != "context_reference":
@@ -1254,9 +1266,7 @@ async def chat(agent_name: str, req: ChatRequest, request: Request):
     cached = get_cached_response(req.message, agent_id=agent_name) if not req.history else None
     if cached:
         print(f"  [CACHE HIT] sim={cached['similarity']} | {cached['original_query'][:60]}")
-        async def cached_stream():
-            yield cached["response"]
-        return StreamingResponse(cached_stream(), media_type="text/plain; charset=utf-8")
+        return completed_text_response(cached["response"], source="cache")
 
     try:
         t0 = time.monotonic()
@@ -1322,14 +1332,7 @@ async def chat(agent_name: str, req: ChatRequest, request: Request):
             history=history_dicts,
         )
 
-        async def no_results_clarification_stream():
-            yield clarification
-            add_turn(session_id, req.message, clarification)
-
-        return StreamingResponse(
-            no_results_clarification_stream(),
-            media_type="text/plain; charset=utf-8",
-        )
+        return completed_text_response(clarification, source="clarification")
 
     # Collect unique image IDs from all retrieved chunks (preserve order)
     # Only used if KB_ENABLE_IMAGES is on.
@@ -1396,6 +1399,7 @@ async def chat(agent_name: str, req: ChatRequest, request: Request):
                 "llm_latency_ms": llm_latency_ms,
                 "total_latency_ms": total_latency_ms,
                 "fallback_triggered": not answered,
+                "source": "llm",
             },
             eval_result=eval_result,
         )

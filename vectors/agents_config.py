@@ -8,7 +8,7 @@ load_dotenv()
 BASE_DIR = os.path.dirname(__file__)
 
 AGENTS: dict[str, dict] = {
-    "ttu-online": {
+    "online_chat": {
         "collection": "ttu_kb",
         "display_name": "TTU Online",
         "description": "Texas Tech University Online programs, admissions, and courses.",
@@ -45,7 +45,7 @@ AGENTS: dict[str, dict] = {
             "email online@ttu.edu, programs https://www.depts.ttu.edu/online/programs/, and GoOnline.ttu.edu."
         ),
     },
-    "k12": {
+    "k12_chat": {
         "collection": "k12",
         "display_name": "K-12",
         "description": "K-12 education programs and resources at Texas Tech.",

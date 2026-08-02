@@ -18,8 +18,8 @@ function generateId() {
 
 // Display names for greeting text — keyed by agent ID
 const AGENT_DISPLAY: Record<string, string> = {
-  "ttu-online": "TTU Online",
-  "k12": "K-12",
+  "online_chat": "TTU Online",
+  "k12_chat": "K-12",
 };
 
 function freshConversation(agentId: string): Conversation {

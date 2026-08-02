@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import base64
 import json
 import traceback
 import uuid
@@ -33,6 +34,124 @@ def _hash_ip(ip: str) -> str:
 def _append_record(record: dict[str, Any]) -> None:
     with _log_file(_today_label()).open("a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    # Publish only after the durable append so live consumers never see a
+    # record that is missing from the historical API.
+    from log_stream import publish
+    publish(_canonicalize_record(record))
+
+
+def _canonicalize_record(record: dict[str, Any]) -> dict[str, Any]:
+    from agent_ids import canonical_agent_id
+
+    query = record.get("query")
+    if not isinstance(query, dict):
+        return record
+    old_agent = query.get("agent_routed_to")
+    new_agent = canonical_agent_id(old_agent) if isinstance(old_agent, str) else old_agent
+    if new_agent == old_agent:
+        return record
+    normalized = dict(record)
+    normalized["query"] = {**query, "agent_routed_to": new_agent}
+    return normalized
+
+
+def _encode_cursor(filename: str, line_number: int) -> str:
+    raw = json.dumps({"file": filename, "line": line_number}, separators=(",", ":"))
+    return base64.urlsafe_b64encode(raw.encode()).decode().rstrip("=")
+
+
+def _decode_cursor(cursor: str) -> tuple[str, int]:
+    try:
+        padded = cursor + "=" * (-len(cursor) % 4)
+        value = json.loads(base64.urlsafe_b64decode(padded).decode())
+        filename = value["file"]
+        line_number = value["line"]
+        if not isinstance(filename, str) or not filename.endswith(".jsonl"):
+            raise ValueError
+        if not isinstance(line_number, int) or line_number < 0:
+            raise ValueError
+        return filename, line_number
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError("Invalid log cursor") from exc
+
+
+def _timestamp(record: dict[str, Any]) -> datetime | None:
+    value = record.get("timestamp")
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed
+    except ValueError:
+        return None
+
+
+def list_log_records(
+    *,
+    agent: str | None = None,
+    since: datetime | None = None,
+    until: datetime | None = None,
+    cursor: str | None = None,
+    limit: int = 100,
+) -> tuple[list[dict[str, Any]], str | None, bool]:
+    """Read log records in append order with an opaque file/line cursor."""
+    from agent_ids import canonical_agent_id
+
+    if since and since.tzinfo is None:
+        since = since.replace(tzinfo=timezone.utc)
+    if until and until.tzinfo is None:
+        until = until.replace(tzinfo=timezone.utc)
+    cursor_position = _decode_cursor(cursor) if cursor else None
+    matched: list[tuple[dict[str, Any], str, int]] = []
+
+    for path in sorted(_LOGS_DIR.glob("*.jsonl")):
+        for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines()):
+            position = (path.name, line_number)
+            if cursor_position and position <= cursor_position:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            record = _canonicalize_record(record)
+            record_agent = canonical_agent_id(
+                (record.get("query") or {}).get("agent_routed_to", "")
+            )
+            if agent and record_agent != canonical_agent_id(agent):
+                continue
+            timestamp = _timestamp(record)
+            if since and (timestamp is None or timestamp < since):
+                continue
+            if until and (timestamp is None or timestamp > until):
+                continue
+            matched.append((record, path.name, line_number))
+            if len(matched) > limit:
+                break
+        if len(matched) > limit:
+            break
+
+    has_more = len(matched) > limit
+    page = matched[:limit]
+    records = [item[0] for item in page]
+    next_cursor = cursor
+    if page:
+        _, filename, line_number = page[-1]
+        next_cursor = _encode_cursor(filename, line_number)
+    return records, next_cursor, has_more
+
+
+def get_log_record(log_id: str) -> dict[str, Any] | None:
+    for path in sorted(_LOGS_DIR.glob("*.jsonl"), reverse=True):
+        for line in path.read_text(encoding="utf-8").splitlines():
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if record.get("log_id") == log_id:
+                return _canonicalize_record(record)
+    return None
 
 
 # ── Public API ─────────────────────────────────────────────────────────────────
@@ -96,6 +215,7 @@ def log_interaction(
             "llm_latency_ms": response_result.get("llm_latency_ms", 0),
             "total_latency_ms": response_result.get("total_latency_ms", 0),
             "fallback_triggered": response_result.get("fallback_triggered", False),
+            "source": response_result.get("source", "llm"),
         },
         "eval_result": eval_result,
         "feedback": None,

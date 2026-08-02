@@ -3,13 +3,13 @@ Ingestion script — indexes documents into Qdrant per agent.
 
 Usage:
     # Ingest one agent's kb/ folder
-    python ingest.py --agent ttu-online
+    python ingest.py --agent online_chat
 
     # Ingest all agents
     python ingest.py --all
 
     # Wipe collection and re-embed
-    python ingest.py --agent ttu-online --full
+    python ingest.py --agent online_chat --full
     python ingest.py --all --full
 
     # Legacy: ingest a single file or URL directly (uses QDRANT_COLLECTION env)
@@ -41,6 +41,7 @@ from qdrant_client.models import (
 )
 
 from agents_config import AGENTS
+from agent_ids import canonical_agent_id
 from embeddings import VECTOR_DIM, embed_batch, sparse_embed_batch
 from qdrant_store import get_client, reset_collection, upsert_points
 
@@ -496,6 +497,7 @@ SUPPORTED_EXTENSIONS = {".docx", ".txt", ".md"}
 
 
 def ingest_agent(agent_name: str, full: bool = False) -> None:
+    agent_name = canonical_agent_id(agent_name)
     if agent_name not in AGENTS:
         print(f"❌ Unknown agent '{agent_name}'. Available: {list(AGENTS.keys())}", file=sys.stderr)
         sys.exit(1)

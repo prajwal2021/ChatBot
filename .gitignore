@@ -3,6 +3,7 @@ vectors/.env
 .env
 *.env
 .env.*
+!vectors/.env.example
 
 # ── Python ─────────────────────────────────────────────────────────────────────
 vectors/.venv/

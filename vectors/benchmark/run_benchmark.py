@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent.parent / ".env")
 
 from agents_config import AGENTS
+from agent_ids import canonical_agent_id
 from embeddings import embed, sparse_embed
 from qdrant_store import get_client
 from qdrant_client.models import FusionQuery, Fusion, Prefetch, SparseVector
@@ -91,9 +92,8 @@ def _avg_score(chunks: list[dict]) -> float:
 
 def evaluate_question(qa: dict) -> dict:
     agent_id = qa.get("agent", "")
-    # Normalise: accept both "ttu_online" and "ttu-online" style keys
-    if agent_id not in AGENTS:
-        agent_id = agent_id.replace("_", "-")
+    # Accept current public IDs and legacy benchmark IDs.
+    agent_id = canonical_agent_id(agent_id)
     if agent_id not in AGENTS:
         return {
             "id": qa["id"],
