@@ -388,6 +388,128 @@ heading supports it. Return JSON only as {{"topics":["...", "..."]}}."""
     return []
 
 
+async def generate_capability_details(
+    headings: list[str],
+    topics: list[str],
+    *,
+    assistant_name: str,
+    candidates_by_topic: dict[str, list[str]] | None = None,
+) -> list[dict[str, object]]:
+    """Expand capability labels into supported subtopics, not factual answers."""
+    if not headings or not topics:
+        return []
+
+    source_headings = headings
+    if candidates_by_topic:
+        source_headings = [
+            heading
+            for topic in topics
+            for heading in candidates_by_topic.get(topic, [])
+        ]
+
+    unique: list[str] = []
+    seen: set[str] = set()
+    total_chars = 0
+    for heading in source_headings:
+        clean = re.sub(r"\s+", " ", (heading or "").strip())
+        key = clean.lower()
+        if not clean or key in seen:
+            continue
+        if total_chars + len(clean) > 24_000:
+            break
+        seen.add(key)
+        unique.append(clean)
+        total_chars += len(clean)
+
+    system = f"""Expand a capability menu for the {assistant_name} assistant.
+For every supplied major topic, select one to five candidate heading IDs showing
+the kinds of questions covered inside it. Preserve the supplied topic labels
+and order. Select only headings that are directly and obviously relevant to
+that topic. Never pad a topic with a loosely related heading to reach a quota;
+one strong heading is better than several weak ones. A heading may appear under
+more than one topic when it is genuinely relevant.
+
+This is a description of chatbot coverage, not an answer about a particular
+program. Do not include factual values such as dates, prices, eligibility ages,
+course counts, requirements, or policy claims. Do not select only a few topics.
+Return JSON only in this form:
+{{"topics":[{{"topic":"exact supplied label","heading_ids":[1,2,3]}}]}}.
+Use only IDs listed for that specific topic; never write new subtopics."""
+
+    heading_ids = {heading: index for index, heading in enumerate(unique, start=1)}
+    allowed_ids_by_topic: dict[str, set[int]] = {}
+    candidate_sections: list[str] = []
+    for topic in topics:
+        candidates = (
+            candidates_by_topic.get(topic, [])
+            if candidates_by_topic
+            else unique
+        )
+        allowed_ids = {
+            heading_ids[heading]
+            for heading in candidates
+            if heading in heading_ids
+        }
+        allowed_ids_by_topic[topic.lower()] = allowed_ids
+        candidate_sections.append(
+            f"{topic}:\n" + "\n".join(
+                f"  {heading_id}. {unique[heading_id - 1]}"
+                for heading_id in sorted(allowed_ids)
+            )
+        )
+    user_prompt = "Candidate indexed headings by major topic:\n\n" + "\n\n".join(candidate_sections)
+
+    for model_name in get_utility_models():
+        try:
+            response = await _client.chat.completions.create(
+                model=model_name,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.1,
+                max_completion_tokens=1800,
+                response_format={"type": "json_object"},
+            )
+            content = response.choices[0].message.content if response.choices else ""
+            parsed = _parse_json_object(content or "")
+            items = parsed.get("topics", [])
+            if not isinstance(items, list):
+                continue
+
+            by_topic: dict[str, list[str]] = {}
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                topic = str(item.get("topic", "")).strip()
+                selected_ids = item.get("heading_ids", [])
+                if not topic or not isinstance(selected_ids, list):
+                    continue
+                subtopics: list[str] = []
+                allowed_ids = allowed_ids_by_topic.get(topic.lower(), set())
+                for heading_id in selected_ids:
+                    if not isinstance(heading_id, int) or heading_id not in allowed_ids:
+                        continue
+                    heading = unique[heading_id - 1]
+                    if heading not in subtopics:
+                        subtopics.append(heading)
+                if subtopics:
+                    by_topic[topic.lower()] = subtopics[:5]
+
+            ordered = [
+                {"topic": topic, "subtopics": by_topic[topic.lower()]}
+                for topic in topics
+                if topic.lower() in by_topic
+            ]
+            if len(ordered) == len(topics):
+                return ordered
+        except Exception as e:
+            if _is_quota_error(e) or _is_model_fallback_error(e):
+                continue
+            break
+    return []
+
+
 async def generate_clarification(
     question: str,
     guardrails: str = "",

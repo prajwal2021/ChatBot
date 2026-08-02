@@ -23,6 +23,7 @@ from embeddings import embed, embed_batch, sparse_embed, sparse_embed_batch
 from qdrant_store import get_client
 from ingest import download_sharepoint, run_ingestion_from_bytes, ingest_to_collection  # noqa: F401
 from llm import (
+    generate_capability_details,
     generate_capability_topics,
     generate_clarification,
     get_answer_models,
@@ -418,6 +419,7 @@ def _save_kb_hashes(hashes: dict[str, str]) -> None:
 
 _kb_hashes: dict[str, str] = _load_kb_hashes()
 _topic_menu_cache: dict[str, list[str]] = {}
+_topic_detail_cache: dict[str, list[dict[str, object]]] = {}
 
 
 async def _check_agent(agent_id: str, cfg: dict) -> None:
@@ -434,6 +436,7 @@ async def _check_agent(agent_id: str, cfg: dict) -> None:
         logger.info(f"KB watcher [{agent_id}]: change detected in {filename}, re-ingesting...")
         count = run_ingestion_from_bytes(data, filename, cfg["collection"], full=True)
         _topic_menu_cache.pop(agent_id, None)
+        _topic_detail_cache.pop(agent_id, None)
         _kb_hashes[agent_id] = current_hash
         _save_kb_hashes(_kb_hashes)
         logger.info(f"KB watcher [{agent_id}]: indexed {count} chunks into '{cfg['collection']}'")
@@ -758,6 +761,35 @@ def _is_topics_followup(message: str, history: list[dict]) -> bool:
     return False
 
 
+def _is_topics_detail_followup(message: str, history: list[dict]) -> bool:
+    """True when a user asks to expand a previously displayed topic menu."""
+    normalized = re.sub(r"[^a-z0-9]+", " ", (message or "").lower()).strip()
+    asks_for_detail = bool(
+        re.search(
+            r"\b(?:more\s+details?|more\s+detailed|bit\s+more\s+detailed|"
+            r"expand|breakdown|subtopics?|what\s+(?:is|are)\s+inside|"
+            r"what\s+(?:it|they)\s+(?:has|have|include)|inside\s+(?:it|them)|"
+            r"as\s+points?)\b",
+            normalized,
+        )
+    )
+    if not asks_for_detail:
+        return False
+
+    for turn in reversed(history[-8:]):
+        content = re.sub(
+            r"[^a-z0-9]+",
+            " ",
+            (turn.get("content") or "").lower(),
+        ).strip()
+        if turn.get("role") == "assistant" and re.search(
+            r"\bmajor\s+topics?\s+i\s+can\s+help\s+with\b",
+            content,
+        ):
+            return True
+    return False
+
+
 def _has_specific_information_subject(message: str) -> bool:
     """Distinguish a concrete information request from a bot-coverage request.
 
@@ -851,18 +883,65 @@ def _major_topics_for_agent(agent_name: str) -> list[str]:
     ]
 
 
-async def _topic_response_for_agent(agent_name: str, message: str) -> str:
+def _indexed_topic_headings(agent_name: str) -> list[str]:
+    cfg = AGENTS.get(agent_name, {})
+    topics_by_source = _list_kb_topics(cfg.get("collection", ""), min_repeats=1)
+    return [
+        topic
+        for source_topics in topics_by_source.values()
+        for topic in source_topics
+    ]
+
+
+def _topic_heading_candidates(agent_name: str, topics: list[str]) -> dict[str, list[str]]:
+    """Retrieve a small, relevant heading set for each capability category."""
+    if not topics:
+        return {}
+    collection = AGENTS.get(agent_name, {}).get("collection", "")
+    dense_vectors = embed_batch(topics)
+    sparse_vectors = sparse_embed_batch(topics)
+    client = get_client()
+    candidates: dict[str, list[str]] = {}
+    for topic, dense_vector, sparse_vector in zip(topics, dense_vectors, sparse_vectors):
+        response = client.query_points(
+            collection_name=collection,
+            prefetch=[
+                Prefetch(query=dense_vector, using="dense", limit=24),
+                Prefetch(
+                    query=SparseVector(
+                        indices=sparse_vector[0],
+                        values=sparse_vector[1],
+                    ),
+                    using="sparse",
+                    limit=24,
+                ),
+            ],
+            query=FusionQuery(fusion=Fusion.RRF),
+            limit=12,
+            with_payload=True,
+        )
+        topic_headings: list[str] = []
+        seen: set[str] = set()
+        for point in response.points:
+            payload = point.payload or {}
+            heading = (payload.get("section", "") or "").strip()
+            if not heading:
+                heading = _extract_topic_candidates(payload.get("text", "") or "") or ""
+            key = heading.lower()
+            if heading and key not in seen:
+                seen.add(key)
+                topic_headings.append(heading)
+        candidates[topic] = topic_headings
+    return candidates
+
+
+async def _topics_for_agent(agent_name: str) -> list[str]:
     agent_name = canonical_agent_id(agent_name)
     topics = _topic_menu_cache.get(agent_name, [])
     if not topics:
         cfg = AGENTS.get(agent_name, {})
         try:
-            topics_by_source = _list_kb_topics(cfg.get("collection", ""), min_repeats=1)
-            headings = [
-                topic
-                for source_topics in topics_by_source.values()
-                for topic in source_topics
-            ]
+            headings = _indexed_topic_headings(agent_name)
             topics = await generate_capability_topics(
                 headings,
                 assistant_name=cfg.get("display_name", agent_name),
@@ -873,10 +952,83 @@ async def _topic_response_for_agent(agent_name: str, message: str) -> str:
             _topic_menu_cache[agent_name] = topics
         else:
             topics = _major_topics_for_agent(agent_name)
+    return topics
+
+
+async def _topic_response_for_agent(agent_name: str, message: str) -> str:
+    topics = await _topics_for_agent(agent_name)
     topics = topics[:_requested_topic_count(message, len(topics))]
     return "**Major topics I can help with**\n\n" + "\n".join(
         f"{index}. {topic}" for index, topic in enumerate(topics, start=1)
     )
+
+
+def _fallback_topic_details(topics: list[str], headings: list[str]) -> list[dict[str, object]]:
+    """Derive a best-effort breakdown if semantic grouping is unavailable."""
+    stopwords = {
+        "a", "an", "and", "are", "for", "in", "of", "on", "or", "the",
+        "to", "with", "information", "requirements", "services",
+    }
+    details: list[dict[str, object]] = []
+    for topic in topics:
+        topic_tokens = {
+            token for token in re.findall(r"[a-z0-9]+", topic.lower())
+            if len(token) >= 3 and token not in stopwords
+        }
+        ranked: list[tuple[int, str]] = []
+        for heading in headings:
+            heading_tokens = set(re.findall(r"[a-z0-9]+", heading.lower()))
+            score = len(topic_tokens & heading_tokens)
+            if score and heading.lower() != topic.lower():
+                ranked.append((score, heading))
+        ranked.sort(key=lambda item: (-item[0], len(item[1])))
+        subtopics: list[str] = []
+        seen: set[str] = set()
+        for _, heading in ranked:
+            key = heading.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            subtopics.append(heading.rstrip("?"))
+            if len(subtopics) == 4:
+                break
+        if not subtopics:
+            subtopics = [f"Questions and guidance related to {topic.lower()}"]
+        details.append({"topic": topic, "subtopics": subtopics})
+    return details
+
+
+async def _topic_detail_response_for_agent(agent_name: str) -> str:
+    agent_name = canonical_agent_id(agent_name)
+    topics = await _topics_for_agent(agent_name)
+    details = _topic_detail_cache.get(agent_name, [])
+    if not details:
+        headings: list[str] = []
+        try:
+            headings = _indexed_topic_headings(agent_name)
+            candidates_by_topic = _topic_heading_candidates(agent_name, topics)
+            details = await generate_capability_details(
+                headings,
+                topics,
+                assistant_name=AGENTS.get(agent_name, {}).get("display_name", agent_name),
+                candidates_by_topic=candidates_by_topic,
+            )
+        except Exception as exc:
+            logger.warning("Could not build detailed topic menu for %s: %s", agent_name, exc)
+        if not details:
+            details = _fallback_topic_details(topics, headings)
+        _topic_detail_cache[agent_name] = details
+
+    lines = ["**Major topics and what they include**"]
+    for index, item in enumerate(details, start=1):
+        topic = str(item.get("topic", "")).strip()
+        subtopics = item.get("subtopics", [])
+        if not topic or not isinstance(subtopics, list):
+            continue
+        lines.extend(["", f"{index}. **{topic}**"])
+        lines.extend(f"   - {subtopic}" for subtopic in subtopics if subtopic)
+    lines.append("\nChoose a topic number or name when you want the full answer for that area.")
+    return "\n".join(lines)
 
 
 def _list_kb_topics(collection: str, min_repeats: int = 2) -> dict[str, list[str]]:
@@ -1009,6 +1161,7 @@ def _run_ingest_job(agent_id: str, url: str) -> None:
         _ingest_status = {"state": "running", "detail": f"[{agent_id}] Embedding {filename}..."}
         count = run_ingestion_from_bytes(data, filename, collection, full=True)
         _topic_menu_cache.pop(agent_id, None)
+        _topic_detail_cache.pop(agent_id, None)
         _ingest_status = {"state": "done", "detail": f"[{agent_id}] Indexed {count} chunks from {filename}"}
     except Exception as e:
         _ingest_status = {"state": "error", "detail": str(e)}
@@ -1168,7 +1321,15 @@ async def chat(agent_name: str, req: ChatRequest, request: Request):
 
         return completed_text_response(greeting_response, source="greeting")
 
-    # "What topics can you cover?" — answer directly from the configured
+    # Expand the previously displayed capability menu into subtopics. Handle
+    # this before the general capability detector so "more detail about the
+    # major topics" cannot collapse back into the same short menu.
+    if _is_topics_detail_followup(req.message, history_dicts):
+        detail_response = await _topic_detail_response_for_agent(agent_name)
+
+        return completed_text_response(detail_response, source="topic_details")
+
+    # "What topics can you cover?" — answer directly from the indexed
     # capability map so it cannot be rejected by probabilistic scope routing.
     # Also preserve that subject for follow-ups such as "give me a list of all".
     if _is_topics_query(req.message) or _is_topics_followup(req.message, history_dicts):

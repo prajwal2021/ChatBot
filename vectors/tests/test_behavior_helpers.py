@@ -5,7 +5,12 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from ingest import chunk_text_with_sections
-from llm import _sanitize_output, get_answer_models, resolve_intent
+from llm import (
+    _sanitize_output,
+    generate_capability_details,
+    get_answer_models,
+    resolve_intent,
+)
 from main import (
     _cross_agent_referral,
     _expand_queries,
@@ -13,6 +18,7 @@ from main import (
     _has_specific_information_subject,
     _is_context_reference_query,
     _is_greeting_query,
+    _is_topics_detail_followup,
     _is_topics_followup,
     _is_topics_query,
     _latest_history_subject,
@@ -22,11 +28,32 @@ from main import (
     _resolve_history_reference,
     _resolve_history_list_reference,
     _topic_menu_cache,
+    _topic_detail_cache,
+    _topic_detail_response_for_agent,
     _topic_response_for_agent,
 )
 
 
 class SocialIntentTests(unittest.IsolatedAsyncioTestCase):
+    async def test_capability_details_use_only_indexed_headings(self):
+        response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=(
+                '{"topics":['
+                '{"topic":"Enrollment","heading_ids":[1,999]},'
+                '{"topic":"Testing","heading_ids":[2]}'
+                ']}'
+            )))]
+        )
+        with patch("llm._client.chat.completions.create", new=AsyncMock(return_value=response)):
+            details = await generate_capability_details(
+                ["How to enroll", "Credit by Examination"],
+                ["Enrollment", "Testing"],
+                assistant_name="K-12",
+            )
+
+        self.assertEqual(details[0]["subtopics"], ["How to enroll"])
+        self.assertEqual(details[1]["subtopics"], ["Credit by Examination"])
+
     async def test_social_reply_is_returned_without_reusing_prior_menu(self):
         response = SimpleNamespace(
             choices=[SimpleNamespace(message=SimpleNamespace(content=(
@@ -72,6 +99,62 @@ class SocialIntentTests(unittest.IsolatedAsyncioTestCase):
         headings = generator.await_args.args[0]
         self.assertIn("Credit by Exams", headings)
         _topic_menu_cache.clear()
+
+    def test_detail_request_after_topic_menu_is_contextual(self):
+        history = [{
+            "role": "assistant",
+            "content": (
+                "**Major topics I can help with**\n\n"
+                "1. Admission and Enrollment\n2. Assessment and Testing"
+            ),
+        }]
+        for request in [
+            "can you be bit more detailed",
+            "i need more details",
+            "what does each topic include as points?",
+        ]:
+            with self.subTest(request=request):
+                self.assertTrue(_is_topics_detail_followup(request, history))
+
+        self.assertFalse(_is_topics_detail_followup(
+            "i need more details",
+            [{"role": "assistant", "content": "Tuition depends on the selected program."}],
+        ))
+
+    async def test_topic_detail_response_expands_every_category(self):
+        topics = ["Admission and Enrollment", "Assessment and Testing"]
+        expanded = [
+            {
+                "topic": topics[0],
+                "subtopics": ["Application steps", "Enrollment options"],
+            },
+            {
+                "topic": topics[1],
+                "subtopics": ["Credit by Examination", "Online exam support"],
+            },
+        ]
+        _topic_menu_cache.clear()
+        _topic_detail_cache.clear()
+        _topic_menu_cache["k12"] = topics
+        with (
+            patch("main._indexed_topic_headings", return_value=["Enrollment", "Exams"]),
+            patch("main._topic_heading_candidates", return_value={
+                topics[0]: ["Enrollment"],
+                topics[1]: ["Exams"],
+            }),
+            patch(
+                "main.generate_capability_details",
+                new=AsyncMock(return_value=expanded),
+            ),
+        ):
+            response = await _topic_detail_response_for_agent("k12")
+
+        self.assertIn("1. **Admission and Enrollment**", response)
+        self.assertIn("- Application steps", response)
+        self.assertIn("2. **Assessment and Testing**", response)
+        self.assertIn("- Credit by Examination", response)
+        _topic_menu_cache.clear()
+        _topic_detail_cache.clear()
 
 
 class ConversationReferenceTests(unittest.TestCase):
