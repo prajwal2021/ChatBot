@@ -10,9 +10,10 @@ interface InputAreaProps {
   disabled?: boolean;
   isStreaming?: boolean;
   onStop?: () => void;
+  kbLastUpdated?: string | null;
 }
 
-export function InputArea({ onSend, disabled, isStreaming, onStop }: InputAreaProps) {
+export function InputArea({ onSend, disabled, isStreaming, onStop, kbLastUpdated }: InputAreaProps) {
   const [value, setValue] = useState("");
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
@@ -83,9 +84,14 @@ export function InputArea({ onSend, disabled, isStreaming, onStop }: InputAreaPr
           )}
         </div>
       </div>
-      <p className="text-center text-[11px] text-muted-foreground mt-2">
-        Responses are based on connected knowledge bases only.
-      </p>
+      <div className="mt-2 flex flex-wrap items-center justify-center gap-x-2 text-center text-[10px] leading-tight text-muted-foreground">
+        <span>Responses are based on connected knowledge bases only.</span>
+        {kbLastUpdated && (
+          <span className="whitespace-nowrap opacity-80">
+            Last updated KB: {kbLastUpdated}
+          </span>
+        )}
+      </div>
     </div>
   );
 }

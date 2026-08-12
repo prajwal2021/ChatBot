@@ -81,6 +81,7 @@ export default function AgentChatPage() {
   const agentId = params.agent as string;
 
   const [displayName, setDisplayName] = useState(agentId);
+  const [kbLastUpdated, setKbLastUpdated] = useState<string | null>(null);
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [activeId, setActiveId] = useState("");
   const [hydrated, setHydrated] = useState(false);
@@ -95,13 +96,21 @@ export default function AgentChatPage() {
     const apiUrl = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
     fetch(`${apiUrl}/agents`)
       .then((r) => r.json())
-      .then((agents: { id: string; display_name: string }[]) => {
+      .then((agents: { id: string; display_name: string; kb_last_updated?: string | null }[]) => {
         const found = agents.find((a) => a.id === agentId);
         if (!found) {
           router.replace("/");
           return;
         }
         setDisplayName(found.display_name);
+        if (found.kb_last_updated) {
+          setKbLastUpdated(
+            new Intl.DateTimeFormat(undefined, {
+              dateStyle: "medium",
+              timeStyle: "short",
+            }).format(new Date(found.kb_last_updated))
+          );
+        }
       })
       .catch(() => { /* use agentId as fallback */ });
   }, [agentId, router]);
@@ -461,6 +470,7 @@ export default function AgentChatPage() {
             disabled={isStreaming}
             isStreaming={isStreaming}
             onStop={handleStop}
+            kbLastUpdated={kbLastUpdated}
           />
         </div>
       </div>

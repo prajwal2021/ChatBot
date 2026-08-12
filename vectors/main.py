@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import json
 import logging
 import os
 import re
 import time
 import uuid as _uuid
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path as _Path
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -36,6 +39,7 @@ from cache import get_cached_response, store_cached_response
 from session import get_history, add_turn
 from ratelimit import is_rate_limited
 from log_export import router as log_export_router
+from trace_emitter import build_trace, emit_trace
 
 logger = logging.getLogger("kb_watcher")
 
@@ -396,11 +400,11 @@ KB_POLL_MINUTES = int(os.getenv("KB_POLL_MINUTES", "30"))
 
 # hash state per agent_id
 _kb_hashes_path = _Path(__file__).parent / "logs" / "kb_hashes.json"
+_kb_updates_path = _Path(__file__).parent / "logs" / "kb_last_updated.json"
 
 
 def _load_kb_hashes() -> dict[str, str]:
     try:
-        import json
         if _kb_hashes_path.exists():
             return json.loads(_kb_hashes_path.read_text(encoding="utf-8"))
     except Exception:
@@ -410,14 +414,46 @@ def _load_kb_hashes() -> dict[str, str]:
 
 def _save_kb_hashes(hashes: dict[str, str]) -> None:
     try:
-        import json
         _kb_hashes_path.parent.mkdir(parents=True, exist_ok=True)
         _kb_hashes_path.write_text(json.dumps(hashes, indent=2, sort_keys=True), encoding="utf-8")
     except Exception:
         pass
 
 
+def _load_kb_updates() -> dict[str, str]:
+    try:
+        if _kb_updates_path.exists():
+            return json.loads(_kb_updates_path.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {}
+
+
+def _save_kb_updates(updates: dict[str, str]) -> None:
+    try:
+        _kb_updates_path.parent.mkdir(parents=True, exist_ok=True)
+        _kb_updates_path.write_text(json.dumps(updates, indent=2, sort_keys=True), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _record_kb_update(agent_id: str) -> None:
+    _kb_last_updated[agent_id] = datetime.now(timezone.utc).isoformat()
+    _save_kb_updates(_kb_last_updated)
+
+
 _kb_hashes: dict[str, str] = _load_kb_hashes()
+_kb_last_updated: dict[str, str] = _load_kb_updates()
+
+# Older deployments only persisted hashes. Use the hash file's modification time
+# until each agent completes its next successful ingestion.
+if _kb_hashes_path.exists():
+    _legacy_updated_at = datetime.fromtimestamp(
+        _kb_hashes_path.stat().st_mtime, tz=timezone.utc
+    ).isoformat()
+    for _agent_id in _kb_hashes:
+        _kb_last_updated.setdefault(_agent_id, _legacy_updated_at)
+
 _topic_menu_cache: dict[str, list[str]] = {}
 _topic_detail_cache: dict[str, list[dict[str, object]]] = {}
 
@@ -439,6 +475,7 @@ async def _check_agent(agent_id: str, cfg: dict) -> None:
         _topic_detail_cache.pop(agent_id, None)
         _kb_hashes[agent_id] = current_hash
         _save_kb_hashes(_kb_hashes)
+        _record_kb_update(agent_id)
         logger.info(f"KB watcher [{agent_id}]: indexed {count} chunks into '{cfg['collection']}'")
     except Exception as e:
         logger.error(f"KB watcher [{agent_id}] error: {e}")
@@ -1141,7 +1178,12 @@ def health():
 @app.get("/agents")
 def list_agents():
     return [
-        {"id": k, "display_name": v["display_name"], "description": v["description"]}
+        {
+            "id": k,
+            "display_name": v["display_name"],
+            "description": v["description"],
+            "kb_last_updated": _kb_last_updated.get(k),
+        }
         for k, v in AGENTS.items()
     ]
 
@@ -1162,6 +1204,7 @@ def _run_ingest_job(agent_id: str, url: str) -> None:
         count = run_ingestion_from_bytes(data, filename, collection, full=True)
         _topic_menu_cache.pop(agent_id, None)
         _topic_detail_cache.pop(agent_id, None)
+        _record_kb_update(agent_id)
         _ingest_status = {"state": "done", "detail": f"[{agent_id}] Indexed {count} chunks from {filename}"}
     except Exception as e:
         _ingest_status = {"state": "error", "detail": str(e)}
@@ -1600,5 +1643,26 @@ async def chat(agent_name: str, req: ChatRequest, request: Request):
             },
             eval_result=eval_result,
         )
+
+        # ── NLI trace emission ────────────────────────────
+        if not is_llm_error:
+            _trace = build_trace(
+                session_id          = session_id,
+                agent               = agent_name,
+                query_raw           = req.message,
+                retrieval_result    = retrieval_result,
+                response_text       = full,
+                eval_result         = eval_result,
+                model_used          = get_answer_models()[0],  # TODO: stream_answer() doesn't surface which model in its fallback chain actually succeeded — using the primary model as a stand-in, same workaround log_interaction() already uses above.
+                llm_latency_ms      = llm_latency_ms,
+                total_latency_ms    = total_latency_ms,
+                fallback_triggered  = not answered,
+                is_llm_error        = is_llm_error,
+                cache_hit           = False,
+                crisis_intercepted  = False,
+                guardrail_triggered = bool(guardrails),
+            )
+            asyncio.create_task(emit_trace(_trace))
+        # ─────────────────────────────────────────────────
 
     return StreamingResponse(streamer(), media_type="text/plain; charset=utf-8")
