@@ -37,6 +37,7 @@ services:
       - static_images:/app/static/images
       - model_cache:/root/.cache
       - ./vectors/logs:/app/logs
+      - ./vectors/traces:/app/traces
     depends_on:
       - qdrant
       - redis

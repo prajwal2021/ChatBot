@@ -39,6 +39,7 @@ from cache import get_cached_response, store_cached_response
 from session import get_history, add_turn
 from ratelimit import is_rate_limited
 from log_export import router as log_export_router
+from trace_export import router as trace_export_router
 from trace_emitter import build_trace, emit_trace
 
 logger = logging.getLogger("kb_watcher")
@@ -523,6 +524,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.include_router(trace_export_router)
 app.include_router(log_export_router)
 
 
