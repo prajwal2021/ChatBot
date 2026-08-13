@@ -1438,7 +1438,11 @@ async def chat(agent_name: str, req: ChatRequest, request: Request):
         # A semantic classifier can confuse "programs you answer questions
         # about" or "contact information" with a request for the chatbot's
         # general menu. Concrete information subjects always go to retrieval.
-        if _has_specific_information_subject(req.message):
+        # A message that names the agent's own subject directly (e.g. "what
+        # is TTU Online?") must never fall through to the topics menu either.
+        if _has_specific_information_subject(req.message) or _matches_current_agent_scope(
+            agent_name, req.message
+        ):
             intent = {
                 "action": "search_broad",
                 "rewritten_query": req.message,
