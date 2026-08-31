@@ -125,6 +125,7 @@ def build_prompt(
     question: str,
     chunks: list[dict],
     user_context: list[str] | None = None,
+    has_more: bool = False,
 ) -> str:
     retrieved_context = "\n\n".join(
         f"Evidence {i} (section: {c.get('section') or 'unspecified'}):\n{c['text']}"
@@ -133,8 +134,16 @@ def build_prompt(
     profile = ""
     if user_context:
         profile = "\n\nRelevant user context:\n- " + "\n- ".join(user_context)
+    more_note = ""
+    if has_more:
+        more_note = (
+            "\n\n[There is additional relevant information beyond what's shown above. "
+            "End your answer by noting that more detail is available and invite the user "
+            "to ask about a specific aspect. Do not mention documents, sections, chunks, "
+            "or retrieval when doing this.]"
+        )
     return (
-        f"Retrieved evidence:\n{retrieved_context}{profile}\n\n"
+        f"Retrieved evidence:\n{retrieved_context}{profile}{more_note}\n\n"
         f"Current request:\n{question}"
     )
 
@@ -663,8 +672,9 @@ async def stream_answer(
     guardrails: str = "",
     history: list[dict] | None = None,
     user_context: list[str] | None = None,
+    has_more: bool = False,
 ):
-    prompt = build_prompt(question, chunks, user_context=user_context)
+    prompt = build_prompt(question, chunks, user_context=user_context, has_more=has_more)
 
     # System instruction = base prompt + per-agent guardrails (applied on every request)
     system_instr = SYSTEM_PROMPT

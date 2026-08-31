@@ -33,3 +33,17 @@ def add_turn(session_id: str, query: str, response: str) -> None:
 
 def clear_session(session_id: str) -> None:
     r.delete(f"session:{session_id}")
+
+
+def get_shown_chunks(session_id: str) -> set[str]:
+    """Chunk keys already surfaced in this conversation, so a follow-up asking
+    for "more detail" can prefer unseen content over repeating itself."""
+    return set(r.smembers(f"session_chunks:{session_id}"))
+
+
+def add_shown_chunks(session_id: str, keys: list[str]) -> None:
+    if not keys:
+        return
+    key = f"session_chunks:{session_id}"
+    r.sadd(key, *keys)
+    r.expire(key, SESSION_TTL)

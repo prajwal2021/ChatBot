@@ -36,7 +36,7 @@ from llm import (
 from logger import log_interaction, log_error
 from evaluator import evaluate_response, is_crisis_query
 from cache import get_cached_response, store_cached_response
-from session import get_history, add_turn
+from session import get_history, add_turn, get_shown_chunks, add_shown_chunks
 from ratelimit import is_rate_limited
 from log_export import router as log_export_router
 from trace_export import router as trace_export_router
@@ -558,11 +558,27 @@ _ingest_status: dict = {"state": "idle", "detail": ""}
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
-def _search_collection(collection: str, message: str, top_k: int = 5) -> list[dict]:
+def _chunk_key(source: str, chunk_index: int) -> str:
+    # \x1f (unit separator) can't appear in a source filename, so this never
+    # collides the way "_" or "::" could with a source name containing them.
+    return f"{source}\x1f{chunk_index}"
+
+
+def _search_collection(
+    collection: str,
+    message: str,
+    top_k: int = 5,
+    exclude_keys: set[tuple[str, int]] | None = None,
+) -> tuple[list[dict], int]:
     """Hybrid dense+sparse search against a named collection.
 
     For multi-topic questions, we expand into a few sub-queries and merge results
     so retrieval covers all parts of the user request.
+
+    exclude_keys lets a "give me more detail" follow-up prefer chunks that
+    haven't already been shown in this conversation. Returns (chunks, total
+    candidates found) — the gap between them tells the caller whether there
+    was more relevant material than fit in top_k.
     """
     queries = _expand_queries(message)
     dense_vectors = embed_batch(queries) if len(queries) > 1 else [embed(message)]
@@ -627,30 +643,41 @@ def _search_collection(collection: str, message: str, top_k: int = 5) -> list[di
     # Reserve coverage for every sub-query before filling remaining slots by
     # score. This prevents one easy part of a multi-part question from crowding
     # all other requested parts out of the context window.
-    selected: list[dict] = []
-    selected_keys: set[tuple[str, int]] = set()
+    exclude_keys = exclude_keys or set()
     minimum_per_query = max(1, min(3, top_k // max(1, len(ranked_by_query))))
-    for query_results in ranked_by_query:
-        added = 0
-        for candidate in query_results:
+
+    def _select(skip_excluded: bool) -> list[dict]:
+        selected: list[dict] = []
+        selected_keys: set[tuple[str, int]] = set()
+        for query_results in ranked_by_query:
+            added = 0
+            for candidate in query_results:
+                key = (candidate["source"], candidate["chunk_index"])
+                if key in selected_keys or (skip_excluded and key in exclude_keys):
+                    continue
+                selected.append(candidate)
+                selected_keys.add(key)
+                added += 1
+                if added >= minimum_per_query or len(selected) >= top_k:
+                    break
+
+        remaining = sorted(merged.values(), key=lambda x: x["score"], reverse=True)
+        for candidate in remaining:
+            if len(selected) >= top_k:
+                break
             key = (candidate["source"], candidate["chunk_index"])
-            if key in selected_keys:
+            if key in selected_keys or (skip_excluded and key in exclude_keys):
                 continue
             selected.append(candidate)
             selected_keys.add(key)
-            added += 1
-            if added >= minimum_per_query or len(selected) >= top_k:
-                break
+        return selected
 
-    remaining = sorted(merged.values(), key=lambda x: x["score"], reverse=True)
-    for candidate in remaining:
-        if len(selected) >= top_k:
-            break
-        key = (candidate["source"], candidate["chunk_index"])
-        if key not in selected_keys:
-            selected.append(candidate)
-            selected_keys.add(key)
-    return selected
+    selected = _select(skip_excluded=bool(exclude_keys))
+    if not selected and merged:
+        # Every relevant chunk was already shown earlier in the conversation —
+        # repeating content is better than a false "no information" answer.
+        selected = _select(skip_excluded=False)
+    return selected, len(merged)
 
 
 def _looks_multi_topic(message: str) -> bool:
@@ -1516,7 +1543,7 @@ async def chat(agent_name: str, req: ChatRequest, request: Request):
 
     try:
         t0 = time.monotonic()
-        base_k = 7
+        base_k = 12
         if _requests_exhaustive_answer(req.message):
             base_k = 40
         elif (
@@ -1524,8 +1551,24 @@ async def chat(agent_name: str, req: ChatRequest, request: Request):
             or _looks_multi_topic(req.message)
             or _looks_multi_topic(retrieval_query_with_context)
         ):
-            base_k = 18
-        results = _search_collection(collection, retrieval_query_with_context, top_k=base_k)
+            base_k = 25
+
+        # On a "give me more detail" style follow-up, prefer chunks that
+        # haven't already been shown in this conversation over repeating them.
+        exclude_keys: set[tuple[str, int]] | None = None
+        if reference_query:
+            shown_raw = get_shown_chunks(session_id)
+            if shown_raw:
+                exclude_keys = set()
+                for raw in shown_raw:
+                    src, _, idx_str = raw.rpartition("\x1f")
+                    if src and idx_str.isdigit():
+                        exclude_keys.add((src, int(idx_str)))
+
+        results, total_candidates = _search_collection(
+            collection, retrieval_query_with_context, top_k=base_k, exclude_keys=exclude_keys
+        )
+        has_more_content = total_candidates > len(results)
         if (
             _requests_exhaustive_answer(req.message)
             and re.search(r"\b(?:programs?|degrees?|certificates?)\b", req.message, re.IGNORECASE)
@@ -1603,6 +1646,7 @@ async def chat(agent_name: str, req: ChatRequest, request: Request):
             guardrails=guardrails,
             history=history_dicts,
             user_context=persistent_context,
+            has_more=has_more_content,
         ):
             full += chunk
             yield chunk
@@ -1619,6 +1663,10 @@ async def chat(agent_name: str, req: ChatRequest, request: Request):
             if not req.history:
                 store_cached_response(req.message, full, agent_id=agent_name)
             add_turn(session_id, req.message, full)
+            add_shown_chunks(
+                session_id,
+                [_chunk_key(r["source"], r["chunk_index"]) for r in results],
+            )
 
         eval_result = evaluate_response(
             query=req.message,
