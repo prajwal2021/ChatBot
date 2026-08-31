@@ -376,21 +376,6 @@ def _matches_current_agent_scope(agent_name: str, message: str) -> bool:
     return any(re.search(pattern, lowered, re.IGNORECASE) for pattern in patterns)
 
 
-def _out_of_scope_response(agent_name: str, message: str) -> str:
-    """Return a friendly boundary with an appropriate referral."""
-    agent_name = canonical_agent_id(agent_name)
-    label = AGENTS.get(agent_name, {}).get("display_name", agent_name)
-    lowered = (message or "").lower()
-    if re.search(r"\b(medication|medicine|dose|dosage|diagnos|symptom|medical|health)\b", lowered):
-        referral = "Please consult a qualified healthcare professional."
-    elif re.search(r"\b(legal|lawsuit|attorney|lawyer)\b", lowered):
-        referral = "Please consult a qualified legal professional."
-    elif re.search(r"\b(invest|tax|stock|financial advice)\b", lowered):
-        referral = "Please consult a qualified financial professional."
-    else:
-        referral = "A trusted resource on that subject will be better able to help."
-    return f"I’m here to help with {label} questions, so I can’t reliably answer that one. {referral}"
-
 # When false, the backend will not emit the UI image protocol (__IMAGES__) even if
 # image_ids exist in Qdrant payloads.
 KB_ENABLE_IMAGES = os.getenv("KB_ENABLE_IMAGES", "false").strip().lower() in {"1", "true", "yes", "y"}
@@ -1498,20 +1483,21 @@ async def chat(agent_name: str, req: ChatRequest, request: Request):
             return completed_text_response(clarification, source="clarification")
 
     if intent["action"] == "out_of_scope":
-        # The probabilistic classifier cannot veto an explicit match for the
-        # current assistant's own vocabulary. Continue to retrieval in that
-        # case; only deterministic cross-agent routing happens earlier.
-        if _matches_current_agent_scope(agent_name, req.message):
-            intent = {
-                "action": "search_broad",
-                "rewritten_query": req.message,
-                "clarification_question": "",
-                "error": "",
-            }
-        else:
-            scope_response = _out_of_scope_response(agent_name, req.message)
-
-            return completed_text_response(scope_response, source="out_of_scope")
+        # A semantic guess made without seeing the KB's actual content can
+        # wrongly refuse real, answerable material — e.g. a newly added
+        # section whose vocabulary was never anticipated by any keyword list.
+        # Rather than trusting that guess (or hand-maintaining a per-agent
+        # keyword list that has to be updated every time the KB grows), always
+        # continue to retrieval and let the grounded LLM decide — it already
+        # has explicit rules (SYSTEM_PROMPT + each agent's own guardrails) for
+        # declining genuinely unrelated or sensitive topics using the real
+        # evidence, not a guess made before retrieval even ran.
+        intent = {
+            "action": "search_broad",
+            "rewritten_query": req.message,
+            "clarification_question": "",
+            "error": "",
+        }
 
     retrieval_query = intent["rewritten_query"] or req.message
     if _looks_multi_topic(req.message) and intent["action"] != "context_reference":
