@@ -1425,6 +1425,8 @@ async def chat(agent_name: str, req: ChatRequest, request: Request):
                 guardrails=guardrails,
                 history=history_dicts,
                 models=[FULL_KB_CONTEXT_MODEL],
+                verify=False,
+                evidence_in_system=True,
             ):
                 full += chunk
                 yield chunk

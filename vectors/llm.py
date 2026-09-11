@@ -674,13 +674,32 @@ async def stream_answer(
     user_context: list[str] | None = None,
     has_more: bool = False,
     models: list[str] | None = None,
+    verify: bool = True,
+    evidence_in_system: bool = False,
 ):
-    prompt = build_prompt(question, chunks, user_context=user_context, has_more=has_more)
-
     # System instruction = base prompt + per-agent guardrails (applied on every request)
     system_instr = SYSTEM_PROMPT
     if guardrails:
         system_instr += f"\n\nAgent scope rules:\n{guardrails}"
+
+    if evidence_in_system:
+        # Put the (large, identical-per-agent) evidence in the system message
+        # instead of the per-request user message. OpenAI's automatic prompt
+        # caching only matches an identical prefix from the very start of the
+        # request — history varies by session, so evidence placed after it
+        # (as build_prompt does) would never hit the cache. Evidence in the
+        # system message stays a stable, cacheable prefix across every
+        # request to this agent, history or not.
+        retrieved_context = "\n\n".join(
+            f"Evidence {i} (section: {c.get('section') or 'unspecified'}):\n{c['text']}"
+            for i, c in enumerate(chunks, start=1)
+        )
+        system_instr += f"\n\nRetrieved evidence:\n{retrieved_context}"
+        prompt = f"Current request:\n{question}"
+        if user_context:
+            prompt = "Relevant user context:\n- " + "\n- ".join(user_context) + f"\n\n{prompt}"
+    else:
+        prompt = build_prompt(question, chunks, user_context=user_context, has_more=has_more)
 
     # Build multi-turn messages — system, then history turns, then current prompt
     messages: list[dict] = [{"role": "system", "content": system_instr}]
@@ -688,8 +707,31 @@ async def stream_answer(
     messages.append({"role": "user", "content": prompt})
 
     for model_name in (models or get_answer_models()):
-        print(f"Trying model: {model_name} | max_completion_tokens=2048 | history={len(messages)-2} turns")
+        print(f"Trying model: {model_name} | verify={verify} | max_completion_tokens=2048 | history={len(messages)-2} turns")
         try:
+            if not verify:
+                # Real token-level streaming, single model call. Trades away
+                # the independent verify-and-correct pass (it can't run before
+                # the user sees anything once tokens are streamed live) for
+                # much lower time-to-first-token — used by the full-KB-context
+                # pipeline, which already has the whole KB as evidence and
+                # relies on the system prompt's own grounding rules instead.
+                stream = await _client.chat.completions.create(
+                    model=model_name,
+                    messages=messages,
+                    temperature=0.2,
+                    max_completion_tokens=2048,
+                    stream=True,
+                )
+                async for chunk in stream:
+                    delta = chunk.choices[0].delta.content if chunk.choices else None
+                    if delta:
+                        yield delta
+
+                if _DEBUG:
+                    yield _debug_footer(chunks)
+                return
+
             full = ""
             stream = await _client.chat.completions.create(
                 model=model_name,
