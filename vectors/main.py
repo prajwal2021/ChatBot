@@ -380,6 +380,13 @@ def _matches_current_agent_scope(agent_name: str, message: str) -> bool:
 # image_ids exist in Qdrant payloads.
 KB_ENABLE_IMAGES = os.getenv("KB_ENABLE_IMAGES", "false").strip().lower() in {"1", "true", "yes", "y"}
 
+# Stopgap alternative to RAG retrieval: dump the entire KB into the model's
+# context instead of picking top-k chunks, while retrieval-completeness bugs
+# (missed chunks, misattributed headings) get a permanent fix. Does not
+# replace the RAG path — flip off to go back to it.
+FULL_KB_CONTEXT_MODE = os.getenv("FULL_KB_CONTEXT_MODE", "false").strip().lower() in {"1", "true", "yes", "y"}
+FULL_KB_CONTEXT_MODEL = os.getenv("FULL_KB_CONTEXT_MODEL", "gpt-4.1")
+
 # ── KB auto-sync (per-agent) ───────────────────────────────────────────────────
 
 KB_POLL_MINUTES = int(os.getenv("KB_POLL_MINUTES", "30"))
@@ -442,6 +449,36 @@ if _kb_hashes_path.exists():
 
 _topic_menu_cache: dict[str, list[str]] = {}
 _topic_detail_cache: dict[str, list[dict[str, object]]] = {}
+_full_kb_cache: dict[str, list[dict]] = {}
+
+
+def _full_kb_chunks(agent_name: str) -> list[dict]:
+    """All chunks for an agent's collection, for the full-KB-context stopgap
+    pipeline (FULL_KB_CONTEXT_MODE). Cached per agent; cleared on re-ingestion."""
+    if agent_name in _full_kb_cache:
+        return _full_kb_cache[agent_name]
+    collection = AGENTS[agent_name]["collection"]
+    client = get_client()
+    chunks: list[dict] = []
+    offset = None
+    while True:
+        points, offset = client.scroll(
+            collection_name=collection, limit=256, with_payload=True, with_vectors=False, offset=offset,
+        )
+        for point in points:
+            payload = point.payload or {}
+            chunks.append({
+                "text": payload.get("text", "") or "",
+                "source": payload.get("source", "") or "",
+                "chunk_index": int(payload.get("chunk_index", 0) or 0),
+                "section": payload.get("section", "") or "",
+                "score": 1.0,
+                "image_ids": payload.get("image_ids", []) or [],
+            })
+        if offset is None:
+            break
+    _full_kb_cache[agent_name] = chunks
+    return chunks
 
 
 async def _check_agent(agent_id: str, cfg: dict) -> None:
@@ -459,6 +496,7 @@ async def _check_agent(agent_id: str, cfg: dict) -> None:
         count = run_ingestion_from_bytes(data, filename, cfg["collection"], full=True)
         _topic_menu_cache.pop(agent_id, None)
         _topic_detail_cache.pop(agent_id, None)
+        _full_kb_cache.pop(agent_id, None)
         _kb_hashes[agent_id] = current_hash
         _save_kb_hashes(_kb_hashes)
         _record_kb_update(agent_id)
@@ -1218,6 +1256,7 @@ def _run_ingest_job(agent_id: str, url: str) -> None:
         count = run_ingestion_from_bytes(data, filename, collection, full=True)
         _topic_menu_cache.pop(agent_id, None)
         _topic_detail_cache.pop(agent_id, None)
+        _full_kb_cache.pop(agent_id, None)
         _record_kb_update(agent_id)
         _ingest_status = {"state": "done", "detail": f"[{agent_id}] Indexed {count} chunks from {filename}"}
     except Exception as e:
@@ -1365,6 +1404,63 @@ async def chat(agent_name: str, req: ChatRequest, request: Request):
         for turn in session_turns:
             history_dicts.append({"role": "user",      "content": turn["query"]})
             history_dicts.append({"role": "assistant",  "content": turn["response"]})
+
+    # ── STOPGAP: full-KB-in-context pipeline (FULL_KB_CONTEXT_MODE) ─────────
+    # Bypasses retrieval/intent routing entirely and hands the whole KB to the
+    # model, so it isn't subject to top-k chunk selection or scope-keyword
+    # guesses. Additive only — the RAG path below is untouched and resumes as
+    # soon as the flag is off. No semantic-cache reuse across the two, since
+    # a stale RAG-era (or full-context-era) cache hit shouldn't leak in when
+    # the flag is flipped.
+    if FULL_KB_CONTEXT_MODE:
+        guardrails = AGENTS[agent_name].get("guardrails", "")
+        full_chunks = _full_kb_chunks(agent_name)
+
+        async def full_kb_streamer():
+            full = ""
+            t_llm = time.monotonic()
+            async for chunk in stream_answer(
+                req.message,
+                full_chunks,
+                guardrails=guardrails,
+                history=history_dicts,
+                models=[FULL_KB_CONTEXT_MODEL],
+            ):
+                full += chunk
+                yield chunk
+            llm_latency_ms = int((time.monotonic() - t_llm) * 1000)
+
+            is_llm_error = full.lower().startswith("error generating response")
+            if not is_llm_error:
+                add_turn(session_id, req.message, full)
+
+            log_interaction(
+                session_id=session_id,
+                query_text=req.message,
+                agent=agent_name,
+                user_ip=user_ip,
+                user_agent=user_agent,
+                retrieval_result={
+                    "method": "full_kb_context",
+                    "chunks_retrieved": len(full_chunks),
+                    "retrieval_latency_ms": 0,
+                    "chunks": [],
+                },
+                response_result={
+                    "text": full,
+                    "model_used": FULL_KB_CONTEXT_MODEL,
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "tokens_used": 0,
+                    "llm_latency_ms": llm_latency_ms,
+                    "total_latency_ms": int((time.monotonic() - t_request) * 1000),
+                    "fallback_triggered": False,
+                    "source": "full_kb_context",
+                },
+                eval_result=None,
+            )
+
+        return StreamingResponse(full_kb_streamer(), media_type="text/plain; charset=utf-8")
 
     # Social greetings are conversational turns, not knowledge-base searches.
     # Keeping them out of retrieval prevents arbitrary nearest chunks from

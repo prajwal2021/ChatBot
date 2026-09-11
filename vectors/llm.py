@@ -673,6 +673,7 @@ async def stream_answer(
     history: list[dict] | None = None,
     user_context: list[str] | None = None,
     has_more: bool = False,
+    models: list[str] | None = None,
 ):
     prompt = build_prompt(question, chunks, user_context=user_context, has_more=has_more)
 
@@ -686,7 +687,7 @@ async def stream_answer(
     messages.extend(_history_messages(history))
     messages.append({"role": "user", "content": prompt})
 
-    for model_name in get_answer_models():
+    for model_name in (models or get_answer_models()):
         print(f"Trying model: {model_name} | max_completion_tokens=2048 | history={len(messages)-2} turns")
         try:
             full = ""
