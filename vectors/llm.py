@@ -105,6 +105,9 @@ SAFETY RULES:
 - Answer every materially different part of a multi-part question. If one part
   is absent from the context, identify only that missing part without claiming
   the entire question is unanswered.
+- Only include a URL or link if it appears verbatim in the evidence or agent
+  rules. Never construct, guess, complete, or alter a URL; if no exact link is
+  available, omit the link.
 - Never mention knowledge-base filenames, document names, chunks, retrieval,
   source files, or phrases such as "when in the KB"."""
 
@@ -620,6 +623,92 @@ def _sanitize_output(answer: str, chunks: list[dict], guardrails: str) -> str:
     return clean.strip()
 
 
+class _LinkGuard:
+    """Streaming equivalent of the link filtering in _sanitize_output.
+
+    Text streams through untouched except when a markdown link or bare URL is
+    in flight: only that fragment is held back until it can be checked against
+    the allowed (KB + guardrail) text. Unsupported links are reduced to their
+    label so the user never gets a made-up URL that 404s.
+    """
+
+    _MAX_HOLD = 600
+    _SCHEMES = ("https://", "http://")
+
+    def __init__(self, allowed_text: str):
+        self._allowed = (allowed_text or "").lower()
+        self._buf = ""
+
+    def _ok(self, url: str) -> bool:
+        url = url.strip().strip("<>").rstrip(".,;:!?")
+        if not re.match(r"^(?:https?://|mailto:)", url, re.IGNORECASE):
+            return False
+        return url.lower() in self._allowed
+
+    def feed(self, text: str, final: bool = False) -> str:
+        self._buf += text
+        out: list[str] = []
+        while self._buf:
+            b = self._buf
+            m = re.search(r"\[|https?://", b, re.IGNORECASE)
+            if m is None:
+                hold = 0
+                if not final:
+                    for n in range(min(7, len(b)), 0, -1):
+                        tail = b[-n:].lower()
+                        if any(sch.startswith(tail) for sch in self._SCHEMES):
+                            hold = n
+                            break
+                out.append(b[: len(b) - hold])
+                self._buf = b[len(b) - hold:]
+                break
+            if m.start():
+                out.append(b[: m.start()])
+                self._buf = b = b[m.start():]
+
+            if b[0] == "[":
+                close = b.find("]")
+                if close == -1 or close + 1 >= len(b):
+                    if final or len(b) > self._MAX_HOLD:
+                        out.append(b[0])
+                        self._buf = b[1:]
+                        continue
+                    break
+                if b[close + 1] != "(":
+                    out.append(b[: close + 1])
+                    self._buf = b[close + 1:]
+                    continue
+                end = b.find(")", close + 2)
+                if end == -1:
+                    if final or len(b) > self._MAX_HOLD:
+                        out.append(b[: close + 1])
+                        self._buf = b[close + 1:]
+                        continue
+                    break
+                label = b[1:close]
+                parts = b[close + 2:end].strip().split()
+                target = parts[0] if parts else ""
+                self._buf = b[end + 1:]
+                if self._ok(target):
+                    out.append(b[: end + 1])
+                elif not re.match(r"^https?://", label.strip(), re.IGNORECASE):
+                    out.append(label)
+                continue
+
+            end_m = re.search(r"[\s)\]>\"']", b)
+            if end_m is None:
+                if not final and len(b) <= self._MAX_HOLD:
+                    break
+                url, rest = b, ""
+            else:
+                url, rest = b[: end_m.start()], b[end_m.start():]
+            self._buf = rest
+            if self._ok(url):
+                out.append(url)
+        return "".join(out)
+
+
+
 async def _verify_answer(
     question: str,
     draft: str,
@@ -723,10 +812,18 @@ async def stream_answer(
                     max_completion_tokens=2048,
                     stream=True,
                 )
+                link_guard = _LinkGuard(
+                    "\n".join(c.get("text", "") for c in chunks) + "\n" + guardrails
+                )
                 async for chunk in stream:
                     delta = chunk.choices[0].delta.content if chunk.choices else None
                     if delta:
-                        yield delta
+                        piece = link_guard.feed(delta)
+                        if piece:
+                            yield piece
+                tail = link_guard.feed("", final=True)
+                if tail:
+                    yield tail
 
                 if _DEBUG:
                     yield _debug_footer(chunks)
