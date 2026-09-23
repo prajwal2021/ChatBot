@@ -251,6 +251,43 @@ def _parse_json_object(text: str) -> dict:
         return {}
 
 
+_CRISIS_CLASSIFIER_PROMPT = """You screen messages sent to a university information chatbot for personal safety risk.
+Return JSON with exactly one key: {"crisis": true} or {"crisis": false}.
+
+crisis = true ONLY when the sender describes themselves, or someone they are with, as currently in danger: thoughts of suicide or self-harm, feeling hopeless or not wanting to be alive, a medical or mental-health emergency happening now (for example a panic attack, overdose, or being unable to breathe), or an immediate threat to safety.
+
+crisis = false when the message is an ordinary question or statement that merely contains alarming words, including: names of academic programs or courses (for example "Emergency Management", "Counseling & Addiction Recovery Sciences"), questions about policies, emergency contacts, campus safety information, or counseling services asked for information, and anything about a topic rather than the sender's own situation.
+
+If you are genuinely unsure whether the sender is personally at risk, return true."""
+
+
+async def classify_crisis(message: str) -> bool | None:
+    """True/False from a small model; None when it could not be determined."""
+    messages = [
+        {"role": "system", "content": _CRISIS_CLASSIFIER_PROMPT},
+        {"role": "user", "content": message[:2000]},
+    ]
+    for model_name in get_utility_models():
+        try:
+            response = await _client.chat.completions.create(
+                model=model_name,
+                messages=messages,
+                temperature=0,
+                max_completion_tokens=20,
+                response_format={"type": "json_object"},
+            )
+            content = response.choices[0].message.content if response.choices else ""
+            parsed = _parse_json_object(content or "")
+            if isinstance(parsed.get("crisis"), bool):
+                return parsed["crisis"]
+        except Exception as e:
+            if _is_quota_error(e) or _is_model_fallback_error(e):
+                continue
+            return None
+    return None
+
+
+
 async def resolve_intent(
     question: str,
     guardrails: str = "",

@@ -28,13 +28,19 @@ from ingest import download_sharepoint, run_ingestion_from_bytes, ingest_to_coll
 from llm import (
     generate_capability_details,
     generate_capability_topics,
+    classify_crisis,
     generate_clarification,
     get_answer_models,
     resolve_intent,
     stream_answer,
 )
 from logger import log_interaction, log_error
-from evaluator import evaluate_response, is_crisis_query
+from evaluator import (
+    CRISIS_FALLBACK_PHRASES,
+    CRISIS_STRONG_PHRASES,
+    evaluate_response,
+    is_crisis_query,
+)
 from cache import get_cached_response, store_cached_response
 from session import get_history, add_turn, get_shown_chunks, add_shown_chunks
 from ratelimit import is_rate_limited
@@ -1311,22 +1317,87 @@ _CRISIS_RESPONSE = (
     "For questions about TTU programs, I'm here to assist."
 )
 
-_CRISIS_KEYWORDS_MAIN = [
-    "killing myself", "kill myself", "suicide", "overdose", "panic attack",
-    "self harm", "harm myself", "hurt myself", "end my life", "want to die",
-    "emergency", "severe panic",
-]
-
-
 def get_crisis_response(query: str) -> str | None:
+    """Instant path for unambiguous self-harm phrases. Everything subtler is
+    judged by the semantic classifier in the chat() wrapper."""
     lower = query.lower()
-    if any(kw in lower for kw in _CRISIS_KEYWORDS_MAIN):
+    if any(kw in lower for kw in CRISIS_STRONG_PHRASES):
         return _CRISIS_RESPONSE
     return None
 
 
+_CRISIS_CHECK_TIMEOUT_S = 3.0
+
+
+async def _crisis_check(message: str) -> bool:
+    try:
+        verdict = await asyncio.wait_for(classify_crisis(message), _CRISIS_CHECK_TIMEOUT_S)
+    except Exception:
+        verdict = None
+    if verdict is None:
+        lower = message.lower()
+        return any(p in lower for p in CRISIS_FALLBACK_PHRASES)
+    return verdict
+
+
 @app.post("/chat/{agent_name}")
 async def chat(agent_name: str, req: ChatRequest, request: Request):
+    """Runs the normal pipeline while a small model checks, in parallel, whether
+    the message is a genuine personal crisis. The response stream is held only
+    until that check resolves (normally long before the first token), and is
+    replaced by the crisis message if it flags one."""
+    crisis_task = asyncio.create_task(_crisis_check(req.message))
+    try:
+        response = await _chat_impl(agent_name, req, request)
+    except BaseException:
+        crisis_task.cancel()
+        raise
+    if getattr(response, "handled_crisis", False):
+        crisis_task.cancel()
+        return response
+
+    inner = response.body_iterator
+
+    async def guarded():
+        first = asyncio.ensure_future(inner.__anext__())
+        try:
+            is_crisis = await crisis_task
+        except Exception:
+            is_crisis = False
+        if is_crisis:
+            first.cancel()
+            await asyncio.gather(first, return_exceptions=True)
+            try:
+                await inner.aclose()
+            except Exception:
+                pass
+            yield _CRISIS_RESPONSE
+            log_interaction(
+                session_id=req.session_id or str(_uuid.uuid4()),
+                query_text=req.message,
+                agent=canonical_agent_id(agent_name),
+                user_ip=request.client.host if request.client else "",
+                user_agent=request.headers.get("user-agent", ""),
+                retrieval_result={"method": "crisis_classifier", "chunks_retrieved": 0,
+                                  "retrieval_latency_ms": 0, "chunks": []},
+                response_result={"text": _CRISIS_RESPONSE, "model_used": "none",
+                                 "source": "crisis_classifier"},
+                eval_result=None,
+            )
+            return
+        try:
+            chunk = await first
+        except StopAsyncIteration:
+            return
+        yield chunk
+        async for chunk in inner:
+            yield chunk
+
+    response.body_iterator = guarded()
+    return response
+
+
+async def _chat_impl(agent_name: str, req: ChatRequest, request: Request):
     agent_name = canonical_agent_id(agent_name)
     if agent_name not in AGENTS:
         raise HTTPException(
@@ -1394,7 +1465,9 @@ async def chat(agent_name: str, req: ChatRequest, request: Request):
     # Crisis interception — bypass cache and session history
     crisis_msg = get_crisis_response(req.message)
     if crisis_msg:
-        return completed_text_response(crisis_msg, source="crisis", add_to_session=False)
+        crisis_response = completed_text_response(crisis_msg, source="crisis", add_to_session=False)
+        crisis_response.handled_crisis = True
+        return crisis_response
 
     # Use the conversation history supplied by the frontend. Keep Redis as a
     # fallback for existing API clients that use a stable session_id.

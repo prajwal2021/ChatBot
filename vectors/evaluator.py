@@ -41,15 +41,23 @@ _response_cache: deque[str] = deque(maxlen=50)
 
 # ── Crisis detection ──────────────────────────────────────────────────────────
 
-_CRISIS_KEYWORDS = [
-    "killing myself", "suicide", "overdose", "panic attack", "self harm",
-    "hurt myself", "end my life", "want to die", "emergency", "severe panic",
+# Unambiguous self-harm phrases: always treated as a crisis, instantly.
+CRISIS_STRONG_PHRASES = [
+    "killing myself", "kill myself", "suicide", "overdose", "self harm",
+    "harm myself", "hurt myself", "end my life", "want to die",
+]
+
+# Phrases that can also appear in ordinary questions (program names, policies).
+# Only used as a fallback when the semantic crisis classifier is unavailable;
+# otherwise the classifier decides from the whole message.
+CRISIS_FALLBACK_PHRASES = [
+    "panic attack", "severe panic", "medical emergency", "having an emergency",
 ]
 
 
 def is_crisis_query(query: str) -> bool:
     lower = query.lower()
-    return any(kw in lower for kw in _CRISIS_KEYWORDS)
+    return any(kw in lower for kw in CRISIS_STRONG_PHRASES)
 
 
 # ── Term extraction ────────────────────────────────────────────────────────────
