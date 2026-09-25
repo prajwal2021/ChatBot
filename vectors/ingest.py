@@ -28,6 +28,7 @@ from pathlib import Path
 
 import requests
 from docx import Document as DocxDocument
+from docx.text.hyperlink import Hyperlink as DocxHyperlink
 from docx.text.paragraph import Paragraph as DocxParagraph
 from docx.table import Table as DocxTable
 from docx.oxml.ns import qn as _qn
@@ -123,6 +124,32 @@ def _has_numpr(para: DocxParagraph) -> bool:
     return pPr is not None and pPr.find(_qn('w:numPr')) is not None
 
 
+def _paragraph_links(para: DocxParagraph) -> list[tuple[str, str]]:
+    """(visible text, external URL) for each hyperlink in a paragraph.
+
+    para.text keeps only the visible link text, so without this the target of
+    e.g. "Degree and course details (opens in new tab)" never reaches the KB and
+    the chatbot has nothing but a guess to link to. Internal anchors (such as
+    "Back to Top") and mailto links are skipped.
+    """
+    found: list[tuple[str, str]] = []
+    for item in para.iter_inner_content():
+        if not isinstance(item, DocxHyperlink):
+            continue
+        url = (item.url or "").strip()
+        text = re.sub(r"\s+", " ", item.text or "").strip()
+        if not url.lower().startswith(("http://", "https://")):
+            continue
+        if url.rstrip("/").lower() in text.lower():
+            continue  # the visible text already is the URL
+        found.append((text or url, url))
+    return found
+
+
+def _link_lines(links: list[tuple[str, str]]) -> list[str]:
+    return [f'Link for "{text}": {url}' for text, url in links]
+
+
 def extract_docx_rich(
     source: bytes | Path,
     source_prefix: str,
@@ -161,6 +188,13 @@ def extract_docx_rich(
                     lines.append("-" * min(len(row_text), 60))
                 else:
                     lines.append(row_text)
+                row_links: list[tuple[str, str]] = []
+                for cell in row.cells:
+                    for cell_para in cell.paragraphs:
+                        for link in _paragraph_links(cell_para):
+                            if link not in row_links:
+                                row_links.append(link)
+                lines.extend(_link_lines(row_links))
             continue
 
         # ── Paragraph ────────────────────────────────────────────────────────
@@ -190,6 +224,7 @@ def extract_docx_rich(
         text = para.text.strip()
         if not text:
             continue
+        links = _paragraph_links(para)
 
         style_name = para.style.name if para.style else ""
 
@@ -211,6 +246,7 @@ def extract_docx_rich(
         else:
             step_counter = 0
             lines.append(text)
+        lines.extend(_link_lines(links))
 
     return "\n".join(lines), saved_ids
 
