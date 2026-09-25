@@ -437,6 +437,89 @@ async def _audit_full_kb_answer(
     except Exception as exc:
         logger.warning("Answer audit failed: %s", exc)
 
+
+# How many KB chunks to attach to a full-context trace as its evidence.
+FULL_KB_TRACE_TOP_K = int(os.getenv("FULL_KB_TRACE_TOP_K", "12"))
+
+
+async def _emit_full_kb_trace(
+    *,
+    agent_name: str,
+    session_id: str,
+    question: str,
+    history: list[dict],
+    answer: str,
+    llm_latency_ms: int,
+    total_latency_ms: int,
+    guardrail_triggered: bool,
+) -> None:
+    """Emit the trace that AgentScope reads, for a full-KB-context answer.
+
+    The full-context path hands the model the whole KB, so there is no retrieval
+    step and therefore no retrieved chunks. The RAG path is the only place that
+    emitted traces, so once full-context mode was switched on nothing reached
+    AgentScope. The evaluation layers grade an answer against the chunks behind
+    it, so we pick the KB chunks most relevant to the question after the answer
+    has already been sent and attach those. This runs in the background and
+    never delays or fails the reply. reconstructed_context marks that the
+    chunks were chosen after the fact rather than being what the model saw.
+    """
+    try:
+        query = question
+        if len(question.split()) < 5:
+            # A short follow-up ("and the cost?") has no meaning on its own.
+            prior = next(
+                (t["content"] for t in reversed(history)
+                 if t.get("role") == "user" and t.get("content")),
+                "",
+            )
+            if prior:
+                query = f"{prior}. {question}"
+
+        t0 = time.monotonic()
+        results, _ = await asyncio.to_thread(
+            _search_collection,
+            AGENTS[agent_name]["collection"],
+            query,
+            FULL_KB_TRACE_TOP_K,
+        )
+        retrieval_result = {
+            "method": "full_kb_context_evidence",
+            "chunks_retrieved": len(results),
+            "retrieval_latency_ms": int((time.monotonic() - t0) * 1000),
+            "chunks": [
+                {
+                    "chunk_id": f"{r['source']}_{r['chunk_index']}",
+                    "source": r["source"],
+                    "text": r["text"],
+                    "qdrant_score": r["score"],
+                    "bm25_score": None,
+                    "rank": i + 1,
+                }
+                for i, r in enumerate(results)
+            ],
+        }
+        trace = build_trace(
+            session_id=session_id,
+            agent=agent_name,
+            query_raw=question,
+            retrieval_result=retrieval_result,
+            response_text=answer,
+            eval_result={},
+            model_used=FULL_KB_CONTEXT_MODEL,
+            llm_latency_ms=llm_latency_ms,
+            total_latency_ms=total_latency_ms,
+            fallback_triggered=False,
+            is_llm_error=False,
+            cache_hit=False,
+            crisis_intercepted=False,
+            guardrail_triggered=guardrail_triggered,
+        )
+        trace["reconstructed_context"] = True
+        await emit_trace(trace)
+    except Exception as exc:
+        logger.warning("Full-KB trace emission failed: %s", exc)
+
 # ── KB auto-sync (per-agent) ───────────────────────────────────────────────────
 
 KB_POLL_MINUTES = int(os.getenv("KB_POLL_MINUTES", "30"))
@@ -1564,6 +1647,20 @@ async def _chat_impl(agent_name: str, req: ChatRequest, request: Request):
                 ))
                 _background_tasks.add(task)
                 task.add_done_callback(_background_tasks.discard)
+
+            if not is_llm_error:
+                trace_task = asyncio.create_task(_emit_full_kb_trace(
+                    agent_name=agent_name,
+                    session_id=session_id,
+                    question=req.message,
+                    history=history_dicts,
+                    answer=full,
+                    llm_latency_ms=llm_latency_ms,
+                    total_latency_ms=int((time.monotonic() - t_request) * 1000),
+                    guardrail_triggered=bool(guardrails),
+                ))
+                _background_tasks.add(trace_task)
+                trace_task.add_done_callback(_background_tasks.discard)
 
             log_interaction(
                 session_id=session_id,
