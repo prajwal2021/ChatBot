@@ -27,6 +27,16 @@ def _log_file(date_label: str) -> Path:
     return _LOGS_DIR / f"{date_label}.jsonl"
 
 
+def log_answer_audit(record: dict[str, Any]) -> None:
+    """Append one background-verifier comparison. Kept in logs/audit/ so the
+    dated interaction logs and their export API are unaffected."""
+    audit_dir = _LOGS_DIR / "audit"
+    audit_dir.mkdir(exist_ok=True)
+    record = {"timestamp": _now_iso(), **record}
+    with (audit_dir / "answer_audit.jsonl").open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
 def _hash_ip(ip: str) -> str:
     return hashlib.sha256(ip.encode()).hexdigest()
 

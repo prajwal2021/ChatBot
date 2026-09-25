@@ -105,6 +105,12 @@ SAFETY RULES:
 - Answer every materially different part of a multi-part question. If one part
   is absent from the context, identify only that missing part without claiming
   the entire question is unanswered.
+- Do not open with "Yes" or "No" unless the evidence states that answer
+  directly. When the answer depends on a condition, start with the condition or
+  caveat the evidence gives (for example, that something is not guaranteed).
+- State each rule, deadline, and timeframe exactly as the evidence gives it. Do
+  not add, chain, or infer relationships between separate timeframes, and do not
+  add statements the evidence does not make in order to support a conclusion.
 - Only include a URL or link if it appears verbatim in the evidence or agent
   rules. Never construct, guess, complete, or alter a URL; if no exact link is
   available, omit the link.
@@ -744,6 +750,18 @@ class _LinkGuard:
                 out.append(url)
         return "".join(out)
 
+
+
+async def audit_answer(
+    question: str,
+    draft: str,
+    chunks: list[dict],
+    guardrails: str,
+    user_context: list[str] | None = None,
+) -> str:
+    """Run the verifier on an answer that has already been delivered. Used only
+    to log how often it would have changed something — never shown to users."""
+    return await _verify_answer(question, draft, chunks, guardrails, user_context)
 
 
 async def _verify_answer(

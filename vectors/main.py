@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import difflib
 import hashlib
+import random
 import json
 import logging
 import os
@@ -28,13 +30,14 @@ from ingest import download_sharepoint, run_ingestion_from_bytes, ingest_to_coll
 from llm import (
     generate_capability_details,
     generate_capability_topics,
+    audit_answer,
     classify_crisis,
     generate_clarification,
     get_answer_models,
     resolve_intent,
     stream_answer,
 )
-from logger import log_interaction, log_error
+from logger import log_answer_audit, log_interaction, log_error
 from evaluator import (
     CRISIS_FALLBACK_PHRASES,
     CRISIS_STRONG_PHRASES,
@@ -392,6 +395,47 @@ KB_ENABLE_IMAGES = os.getenv("KB_ENABLE_IMAGES", "false").strip().lower() in {"1
 # replace the RAG path — flip off to go back to it.
 FULL_KB_CONTEXT_MODE = os.getenv("FULL_KB_CONTEXT_MODE", "false").strip().lower() in {"1", "true", "yes", "y"}
 FULL_KB_CONTEXT_MODEL = os.getenv("FULL_KB_CONTEXT_MODEL", "gpt-4.1")
+# Fraction of full-context answers re-checked by the verifier in the background,
+# for logging only (logs/audit/answer_audit.jsonl). Each audit re-sends the whole
+# KB to the verifier, so keep this low; 0 disables it.
+FULL_KB_AUDIT_SAMPLE_RATE = float(os.getenv("FULL_KB_AUDIT_SAMPLE_RATE", "0.1"))
+
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _norm_ws(text: str) -> str:
+    return re.sub(r"\s+", " ", text or "").strip()
+
+
+async def _audit_full_kb_answer(
+    agent_name: str,
+    session_id: str,
+    question: str,
+    history: list[dict],
+    draft: str,
+    chunks: list[dict],
+    guardrails: str,
+) -> None:
+    try:
+        recent = [
+            f"{t['role']}: {t['content'][:400]}" for t in history[-4:] if t.get("content")
+        ]
+        audit_question = question
+        if recent:
+            audit_question = "Conversation so far:\n" + "\n".join(recent) + f"\n\nCurrent question: {question}"
+        verified = await audit_answer(audit_question, draft, chunks, guardrails)
+        ratio = difflib.SequenceMatcher(None, _norm_ws(draft), _norm_ws(verified)).ratio()
+        log_answer_audit({
+            "agent": agent_name,
+            "session_id": session_id,
+            "question": question,
+            "similarity": round(ratio, 3),
+            "would_change": ratio < 0.9,
+            "draft": draft,
+            "verified": verified,
+        })
+    except Exception as exc:
+        logger.warning("Answer audit failed: %s", exc)
 
 # ── KB auto-sync (per-agent) ───────────────────────────────────────────────────
 
@@ -1508,6 +1552,18 @@ async def _chat_impl(agent_name: str, req: ChatRequest, request: Request):
             is_llm_error = full.lower().startswith("error generating response")
             if not is_llm_error:
                 add_turn(session_id, req.message, full)
+
+            if (
+                not is_llm_error
+                and FULL_KB_AUDIT_SAMPLE_RATE > 0
+                and random.random() < FULL_KB_AUDIT_SAMPLE_RATE
+            ):
+                task = asyncio.create_task(_audit_full_kb_answer(
+                    agent_name, session_id, req.message, history_dicts,
+                    full, full_chunks, guardrails,
+                ))
+                _background_tasks.add(task)
+                task.add_done_callback(_background_tasks.discard)
 
             log_interaction(
                 session_id=session_id,
