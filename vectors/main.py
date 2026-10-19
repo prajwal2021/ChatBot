@@ -19,7 +19,9 @@ from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from typing import Literal
+
+from pydantic import BaseModel, Field
 from qdrant_client.models import FusionQuery, Fusion, Prefetch, SparseVector
 
 from agents_config import AGENTS
@@ -678,6 +680,7 @@ app.add_middleware(
     allow_origins=_CORS_ORIGINS,
     allow_methods=["POST", "GET"],
     allow_headers=["*"],
+    expose_headers=["X-Log-Id", "X-Log-Date"],
 )
 
 app.include_router(trace_export_router)
@@ -703,10 +706,10 @@ class IngestRequest(BaseModel):
 
 
 class FeedbackRequest(BaseModel):
-    log_id: str
-    log_date: str           # "YYYY-MM-DD" UTC
-    feedback_type: str      # "thumbs_up" | "thumbs_down"
-    feedback_text: str = ""
+    log_id: str = Field(min_length=1, max_length=64)
+    log_date: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")   # UTC, from X-Log-Date
+    feedback_type: Literal["thumbs_up", "thumbs_down", "cleared"]
+    feedback_text: str = Field(default="", max_length=2000)
 
 
 _ingest_status: dict = {"state": "idle", "detail": ""}
@@ -1474,11 +1477,17 @@ async def chat(agent_name: str, req: ChatRequest, request: Request):
     until that check resolves (normally long before the first token), and is
     replaced by the crisis message if it flags one."""
     crisis_task = asyncio.create_task(_crisis_check(req.message))
+    # Fixed up front and returned as headers so the client can attach thumbs
+    # up/down feedback to this exact logged interaction via POST /feedback.
+    log_id = str(_uuid.uuid4())
+    log_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     try:
-        response = await _chat_impl(agent_name, req, request)
+        response = await _chat_impl(agent_name, req, request, log_id)
     except BaseException:
         crisis_task.cancel()
         raise
+    response.headers["X-Log-Id"] = log_id
+    response.headers["X-Log-Date"] = log_date
     if getattr(response, "handled_crisis", False):
         crisis_task.cancel()
         return response
@@ -1510,6 +1519,7 @@ async def chat(agent_name: str, req: ChatRequest, request: Request):
                 response_result={"text": _CRISIS_RESPONSE, "model_used": "none",
                                  "source": "crisis_classifier"},
                 eval_result=None,
+                log_id=log_id,
             )
             return
         try:
@@ -1524,7 +1534,7 @@ async def chat(agent_name: str, req: ChatRequest, request: Request):
     return response
 
 
-async def _chat_impl(agent_name: str, req: ChatRequest, request: Request):
+async def _chat_impl(agent_name: str, req: ChatRequest, request: Request, log_id: str):
     agent_name = canonical_agent_id(agent_name)
     if agent_name not in AGENTS:
         raise HTTPException(
@@ -1578,6 +1588,7 @@ async def _chat_impl(agent_name: str, req: ChatRequest, request: Request):
                     "source": source,
                 },
                 eval_result=None,
+                log_id=log_id,
             )
 
         return StreamingResponse(completed_stream(), media_type="text/plain; charset=utf-8")
@@ -1686,6 +1697,7 @@ async def _chat_impl(agent_name: str, req: ChatRequest, request: Request):
                     "source": "full_kb_context",
                 },
                 eval_result=None,
+                log_id=log_id,
             )
 
         return StreamingResponse(full_kb_streamer(), media_type="text/plain; charset=utf-8")
@@ -2006,6 +2018,7 @@ async def _chat_impl(agent_name: str, req: ChatRequest, request: Request):
                 "source": "llm",
             },
             eval_result=eval_result,
+            log_id=log_id,
         )
 
         # ── NLI trace emission ────────────────────────────

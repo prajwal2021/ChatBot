@@ -3,14 +3,20 @@ from __future__ import annotations
 import hashlib
 import base64
 import json
+import os
+import threading
 import traceback
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 _LOGS_DIR = Path(__file__).parent / "logs"
 _LOGS_DIR.mkdir(exist_ok=True)
+
+# Feedback rewrites a whole daily file; appends must not land mid-rewrite or
+# they are lost. One lock covers both (the API runs as a single process).
+_LOG_FILE_LOCK = threading.Lock()
 
 
 # ── Internal helpers ───────────────────────────────────────────────────────────
@@ -42,7 +48,7 @@ def _hash_ip(ip: str) -> str:
 
 
 def _append_record(record: dict[str, Any]) -> None:
-    with _log_file(_today_label()).open("a", encoding="utf-8") as f:
+    with _LOG_FILE_LOCK, _log_file(_today_label()).open("a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
     # Publish only after the durable append so live consumers never see a
     # record that is missing from the historical API.
@@ -175,6 +181,7 @@ def log_interaction(
     retrieval_result: dict[str, Any],
     response_result: dict[str, Any],
     eval_result: dict[str, Any] | None = None,
+    log_id: str | None = None,
 ) -> str:
     """Write one complete interaction to today's .jsonl file.
 
@@ -193,9 +200,12 @@ def log_interaction(
 
     eval_result: output of evaluator.evaluate_response() — optional, stored as-is.
 
-    Returns the log_id (uuid4 string).
+    log_id: pass one to use an id that was already handed to the client
+    (so it can send feedback for this answer); otherwise a uuid4 is generated.
+
+    Returns the log_id.
     """
-    log_id = str(uuid.uuid4())
+    log_id = log_id or str(uuid.uuid4())
     response_text = response_result.get("text", "")
 
     record: dict[str, Any] = {
@@ -244,44 +254,49 @@ def log_feedback(
 ) -> bool:
     """Find a logged interaction by log_id and update its feedback field in-place.
 
-    log_date must be "YYYY-MM-DD" (UTC) matching the file the interaction was written to.
-    feedback_type: "thumbs_up" | "thumbs_down"
+    log_date is the UTC date ("YYYY-MM-DD") the client was given with the
+    answer. The record is written when the answer finishes, which can fall on
+    the next UTC day, so that day is checked too.
+    feedback_type: "thumbs_up" | "thumbs_down" | "cleared" (removes feedback)
     Returns True if the record was found and updated, False otherwise.
     """
-    log_file = _log_file(log_date)
-    if not log_file.exists():
+    try:
+        day = datetime.strptime(log_date, "%Y-%m-%d")
+    except ValueError:
         return False
+    candidates = [day.strftime("%Y-%m-%d"), (day + timedelta(days=1)).strftime("%Y-%m-%d")]
 
-    lines = log_file.read_text(encoding="utf-8").splitlines()
-    updated = False
-    new_lines: list[str] = []
+    feedback = None
+    if feedback_type != "cleared":
+        feedback = {"type": feedback_type, "text": feedback_text, "timestamp": _now_iso()}
 
-    for line in lines:
-        stripped = line.strip()
-        if not stripped:
-            new_lines.append(line)
-            continue
-        try:
-            record = json.loads(stripped)
-        except json.JSONDecodeError:
-            new_lines.append(line)
-            continue
-
-        if record.get("log_id") == log_id:
-            record["feedback"] = {
-                "type": feedback_type,
-                "text": feedback_text,
-                "timestamp": _now_iso(),
-            }
-            new_lines.append(json.dumps(record, ensure_ascii=False))
-            updated = True
-        else:
-            new_lines.append(line)
-
-    if updated:
-        log_file.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
-
-    return updated
+    with _LOG_FILE_LOCK:
+        for label in candidates:
+            log_file = _log_file(label)
+            if not log_file.exists():
+                continue
+            lines = log_file.read_text(encoding="utf-8").splitlines()
+            updated = False
+            new_lines: list[str] = []
+            for line in lines:
+                stripped = line.strip()
+                if not updated and stripped and log_id in stripped:
+                    try:
+                        record = json.loads(stripped)
+                    except json.JSONDecodeError:
+                        record = None
+                    if record is not None and record.get("log_id") == log_id:
+                        record["feedback"] = feedback
+                        new_lines.append(json.dumps(record, ensure_ascii=False))
+                        updated = True
+                        continue
+                new_lines.append(line)
+            if updated:
+                tmp = log_file.with_suffix(".jsonl.tmp")
+                tmp.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+                os.replace(tmp, log_file)
+                return True
+    return False
 
 
 def log_error(
