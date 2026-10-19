@@ -22,6 +22,9 @@ function generateId() {
 }
 
 const NEW_CHAT_TITLE = "New chat";
+// Default title used by the previous UI; chats saved with it should still be
+// auto-titled from their first question.
+const LEGACY_NEW_CHAT_TITLE = "New conversation";
 const SIDEBAR_KEY = "ttu_chat_sidebar_collapsed";
 
 function freshConversation(): Conversation {
@@ -240,7 +243,8 @@ export default function AgentChatPage() {
                 lastMessage: text,
                 updatedAt: new Date(),
                 title:
-                  c.messages.filter((m) => m.role === "user").length === 0 && c.title === NEW_CHAT_TITLE
+                  c.messages.filter((m) => m.role === "user").length === 0 &&
+                  (c.title === NEW_CHAT_TITLE || c.title === LEGACY_NEW_CHAT_TITLE)
                     ? text.slice(0, 48) + (text.length > 48 ? "…" : "")
                     : c.title,
               }

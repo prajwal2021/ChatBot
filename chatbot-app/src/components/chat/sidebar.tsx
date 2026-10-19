@@ -62,7 +62,9 @@ export function Sidebar({
 
   const query = searchQuery.trim().toLowerCase();
   const visible = conversations
-    .filter((c) => c.messages.length > 0 || c.id === activeId)
+    // Chats with no question yet (including greeting-only chats saved by the
+    // previous UI) are placeholders — only the open one is listed.
+    .filter((c) => c.messages.some((m) => m.role === "user") || c.id === activeId)
     .filter((c) => !query || c.title.toLowerCase().includes(query))
     .sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime());
   const sections = buildSections(visible);
