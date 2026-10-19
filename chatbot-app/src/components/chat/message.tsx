@@ -1,112 +1,121 @@
 "use client";
 
+import { memo, useState } from "react";
+import ReactMarkdown, { type Components } from "react-markdown";
+import remarkGfm from "remark-gfm";
+import { AlertCircle, Check, Copy, RotateCcw, ThumbsDown, ThumbsUp } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Message } from "@/types/chat";
-import { Bot, Copy, ThumbsUp, ThumbsDown, RotateCcw, User } from "lucide-react";
-import ReactMarkdown from "react-markdown";
-import { useState } from "react";
-import {
-  Tooltip,
-  TooltipTrigger,
-  TooltipContent,
-} from "@/components/ui/tooltip";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { BrandMark } from "@/components/chat/brand-mark";
+import { API_URL } from "@/lib/api";
 
 interface MessageBubbleProps {
   message: Message;
+  isLast?: boolean;
   onRegenerate?: () => void;
+  onFeedback?: (messageId: string, value: "up" | "down" | null) => void;
 }
 
-export function MessageBubble({ message, onRegenerate }: MessageBubbleProps) {
+const markdownComponents: Components = {
+  a: ({ href, children }) => (
+    <a href={href} target="_blank" rel="noopener noreferrer">
+      {children}
+    </a>
+  ),
+  table: ({ children }) => (
+    <div className="table-wrap">
+      <table>{children}</table>
+    </div>
+  ),
+};
+
+const Markdown = memo(function Markdown({ content }: { content: string }) {
+  return (
+    <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
+      {content}
+    </ReactMarkdown>
+  );
+});
+
+export function MessageBubble({ message, isLast, onRegenerate, onFeedback }: MessageBubbleProps) {
   const isUser = message.role === "user";
   const [copied, setCopied] = useState(false);
-  const [liked, setLiked] = useState<"up" | "down" | null>(null);
+  const liked = message.feedback ?? null;
+  const canRate = Boolean(message.logId && onFeedback);
+  const rate = (value: "up" | "down") => onFeedback?.(message.id, liked === value ? null : value);
 
   const handleCopy = async () => {
-    await navigator.clipboard.writeText(message.content);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
+    try {
+      await navigator.clipboard.writeText(message.content);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1800);
+    } catch {
+      /* clipboard unavailable (e.g. insecure context) */
+    }
   };
 
   const time = new Date(message.timestamp).toLocaleTimeString([], {
-    hour: "2-digit",
+    hour: "numeric",
     minute: "2-digit",
   });
 
-  return (
-    <div
-      className={cn(
-        "group flex gap-3 px-4 py-3 animate-in fade-in slide-in-from-bottom-2 duration-300",
-        isUser && "flex-row-reverse"
-      )}
-    >
-      {/* Avatar */}
-      {!isUser ? (
-        <div className="flex-shrink-0 mt-0.5">
-          <div className="h-8 w-8 rounded-full bg-primary flex items-center justify-center ring-2 ring-background">
-            <Bot className="h-4 w-4 text-primary-foreground" />
-          </div>
-        </div>
-      ) : (
-        <div className="h-8 w-8 rounded-full bg-gradient-to-br from-violet-500 to-indigo-600 flex items-center justify-center ring-2 ring-background flex-shrink-0 mt-0.5">
-          <User className="h-4 w-4 text-white" />
-        </div>
-      )}
-
+  if (isUser) {
+    return (
       <div
-        className={cn(
-          "flex flex-col gap-1 max-w-[75%]",
-          isUser && "items-end"
-        )}
+        id={`msg-${message.id}`}
+        data-user-message={message.id}
+        className="group flex scroll-mt-6 flex-col items-end px-4 py-3 animate-in fade-in slide-in-from-bottom-1 duration-300 sm:px-6"
       >
-        {/* Bubble */}
-        <div
-          className={cn(
-            "rounded-2xl px-4 py-3 text-sm leading-relaxed break-words",
-            isUser
-              ? "bg-primary text-primary-foreground rounded-tr-sm"
-              : "bg-muted text-foreground rounded-tl-sm"
-          )}
-        >
-          {message.isStreaming ? (
-            <span>
-              {message.content}
-              <span className="inline-flex gap-0.5 ml-1">
-                <span className="w-1 h-1 bg-current rounded-full animate-bounce [animation-delay:0ms]" />
-                <span className="w-1 h-1 bg-current rounded-full animate-bounce [animation-delay:150ms]" />
-                <span className="w-1 h-1 bg-current rounded-full animate-bounce [animation-delay:300ms]" />
-              </span>
-            </span>
-          ) : isUser ? (
-            message.content
-          ) : (
-            <ReactMarkdown
-              components={{
-                p: ({ children }) => <p className="mb-2 last:mb-0">{children}</p>,
-                ul: ({ children }) => <ul className="list-disc pl-4 mb-2 space-y-0.5">{children}</ul>,
-                ol: ({ children }) => <ol className="list-decimal pl-4 mb-2 space-y-0.5">{children}</ol>,
-                li: ({ children }) => <li className="leading-relaxed">{children}</li>,
-                strong: ({ children }) => <strong className="font-semibold">{children}</strong>,
-                a: ({ href, children }) => (
-                  <a href={href} target="_blank" rel="noopener noreferrer" className="underline underline-offset-2 hover:opacity-80">
-                    {children}
-                  </a>
-                ),
-              }}
-            >
-              {message.content}
-            </ReactMarkdown>
-          )}
+        <div className="max-w-[85%] whitespace-pre-wrap break-words rounded-3xl bg-secondary px-4 py-2.5 text-[0.9375rem] leading-relaxed text-secondary-foreground sm:max-w-[75%]">
+          {message.content}
         </div>
+        <div className="mt-1 flex items-center gap-0.5 pr-1 opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100">
+          <span className="mr-1 text-[11px] text-muted-foreground">{time}</span>
+          <ActionButton label={copied ? "Copied" : "Copy"} onClick={handleCopy}>
+            {copied ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
+          </ActionButton>
+        </div>
+      </div>
+    );
+  }
+
+  const thinking = message.isStreaming && !message.content;
+
+  return (
+    <div className="group flex gap-3 px-4 py-3 animate-in fade-in duration-300 sm:gap-4 sm:px-6">
+      <BrandMark size="sm" className="mt-0.5" />
+
+      <div className="min-w-0 flex-1 pt-0.5">
+        {thinking ? (
+          <div className="flex h-7 items-center gap-1.5 text-sm text-muted-foreground" aria-live="polite">
+            <span>Thinking</span>
+            <span className="flex gap-1">
+              <span className="thinking-dot h-1 w-1 rounded-full bg-current" />
+              <span className="thinking-dot h-1 w-1 rounded-full bg-current [animation-delay:150ms]" />
+              <span className="thinking-dot h-1 w-1 rounded-full bg-current [animation-delay:300ms]" />
+            </span>
+          </div>
+        ) : message.error ? (
+          <div className="flex items-start gap-2.5 rounded-xl border border-destructive/25 bg-destructive/5 px-4 py-3 text-sm text-foreground">
+            <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-destructive" />
+            <span>{message.content}</span>
+          </div>
+        ) : (
+          <div className="chat-prose">
+            <Markdown content={message.content} />
+          </div>
+        )}
 
         {/* Inline images (assistant only) */}
-        {!isUser && !message.isStreaming && message.imageIds && message.imageIds.length > 0 && (
-          <div className="flex flex-wrap gap-2 mt-2">
+        {!message.isStreaming && message.imageIds && message.imageIds.length > 0 && (
+          <div className="mt-3 flex flex-wrap gap-2">
             {message.imageIds.map((id) => (
               <img
                 key={id}
-                src={`${process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000"}/static/images/${id}`}
+                src={`${API_URL}/static/images/${id}`}
                 alt="Knowledge base illustration"
-                className="max-w-xs rounded-xl border border-border shadow-sm object-contain"
+                className="max-w-xs rounded-xl border border-border object-contain shadow-sm"
                 onError={(e) => {
                   (e.target as HTMLImageElement).style.display = "none";
                 }}
@@ -115,42 +124,38 @@ export function MessageBubble({ message, onRegenerate }: MessageBubbleProps) {
           </div>
         )}
 
-        {/* Timestamp + actions */}
-        <div
-          className={cn(
-            "flex items-center gap-1 px-1",
-            isUser ? "flex-row-reverse" : "flex-row"
-          )}
-        >
-          <span className="text-[10px] text-muted-foreground">{time}</span>
-
-          {!isUser && !message.isStreaming && (
-            <div className="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
-              <ActionButton label={copied ? "Copied!" : "Copy"} onClick={handleCopy}>
-                <Copy className="h-3 w-3" />
-              </ActionButton>
-              <ActionButton
-                label="Good response"
-                onClick={() => setLiked(liked === "up" ? null : "up")}
-                active={liked === "up"}
-              >
-                <ThumbsUp className="h-3 w-3" />
-              </ActionButton>
-              <ActionButton
-                label="Bad response"
-                onClick={() => setLiked(liked === "down" ? null : "down")}
-                active={liked === "down"}
-              >
-                <ThumbsDown className="h-3 w-3" />
-              </ActionButton>
-              {onRegenerate && (
-                <ActionButton label="Regenerate" onClick={onRegenerate}>
-                  <RotateCcw className="h-3 w-3" />
+        {!message.isStreaming && (
+          <div
+            className={cn(
+              "-ml-1.5 mt-2 flex items-center gap-0.5 transition-opacity",
+              isLast ? "opacity-100" : "opacity-0 group-hover:opacity-100 focus-within:opacity-100"
+            )}
+          >
+            {!message.error && (
+              <>
+                <ActionButton label={copied ? "Copied" : "Copy"} onClick={handleCopy}>
+                  {copied ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
                 </ActionButton>
-              )}
-            </div>
-          )}
-        </div>
+                {canRate && (
+                  <>
+                    <ActionButton label="Good response" onClick={() => rate("up")} active={liked === "up"}>
+                      <ThumbsUp className={cn("h-3.5 w-3.5", liked === "up" && "fill-current")} />
+                    </ActionButton>
+                    <ActionButton label="Bad response" onClick={() => rate("down")} active={liked === "down"}>
+                      <ThumbsDown className={cn("h-3.5 w-3.5", liked === "down" && "fill-current")} />
+                    </ActionButton>
+                  </>
+                )}
+              </>
+            )}
+            {onRegenerate && (
+              <ActionButton label={message.error ? "Try again" : "Regenerate"} onClick={onRegenerate}>
+                <RotateCcw className="h-3.5 w-3.5" />
+              </ActionButton>
+            )}
+            <span className="ml-1.5 text-[11px] text-muted-foreground">{time}</span>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -171,9 +176,11 @@ function ActionButton({
     <Tooltip>
       <TooltipTrigger
         onClick={onClick}
+        aria-label={label}
+        aria-pressed={active}
         className={cn(
-          "inline-flex items-center justify-center h-6 w-6 rounded-md hover:bg-accent transition-colors text-muted-foreground hover:text-foreground",
-          active && "text-primary bg-primary/10 hover:bg-primary/15 hover:text-primary"
+          "inline-flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground",
+          active && "bg-accent text-foreground"
         )}
       >
         {children}

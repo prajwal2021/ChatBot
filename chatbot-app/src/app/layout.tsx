@@ -15,8 +15,8 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "ElevenLabs ChatBot",
-  description: "AI-powered conversational assistant",
+  title: "TTU Assistant",
+  description: "Answers about Texas Tech University programs, admissions, and student support.",
 };
 
 export default function RootLayout({

@@ -1,207 +1,311 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
-  MessageSquare,
-  Plus,
-  Search,
-  Trash2,
   MoreHorizontal,
-  ChevronLeft,
-  ChevronRight,
+  PanelLeftClose,
+  PanelLeftOpen,
+  Pencil,
+  Pin,
+  PinOff,
+  Search,
+  SquarePen,
+  Star,
+  StarOff,
+  Trash2,
+  X,
 } from "lucide-react";
-import { Button } from "@/components/ui/button";
-import { ScrollArea } from "@/components/ui/scroll-area";
-import { Badge } from "@/components/ui/badge";
 import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { BrandMark } from "@/components/chat/brand-mark";
 import { cn } from "@/lib/utils";
 import { Conversation } from "@/types/chat";
 
 interface SidebarProps {
   conversations: Conversation[];
   activeId: string;
+  agentLabel: string;
   onSelect: (id: string) => void;
   onNew: () => void;
   onDelete: (id: string) => void;
+  onTogglePin: (id: string) => void;
+  onToggleFavorite: (id: string) => void;
+  onRename: (id: string, title: string) => void;
   collapsed: boolean;
   onToggle: () => void;
+  mobileOpen: boolean;
+  onMobileClose: () => void;
 }
 
 export function Sidebar({
   conversations,
   activeId,
+  agentLabel,
   onSelect,
   onNew,
   onDelete,
+  onTogglePin,
+  onToggleFavorite,
+  onRename,
   collapsed,
   onToggle,
+  mobileOpen,
+  onMobileClose,
 }: SidebarProps) {
   const [searchQuery, setSearchQuery] = useState("");
 
-  const grouped = groupByDate(
-    conversations.filter((c) =>
-      c.title.toLowerCase().includes(searchQuery.toLowerCase())
-    )
-  );
+  const query = searchQuery.trim().toLowerCase();
+  const visible = conversations
+    .filter((c) => c.messages.length > 0 || c.id === activeId)
+    .filter((c) => !query || c.title.toLowerCase().includes(query))
+    .sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime());
+  const sections = buildSections(visible);
+
+  const itemHandlers = { onSelect, onDelete, onTogglePin, onToggleFavorite, onRename };
 
   return (
-    <aside
-      className={cn(
-        "flex flex-col border-r border-border bg-sidebar transition-all duration-300 ease-in-out",
-        collapsed ? "w-14" : "w-72"
-      )}
-    >
-      {/* Header */}
-      <div className="flex items-center justify-between p-3 border-b border-border h-14">
-        {!collapsed && (
-          <span className="text-sm font-semibold text-sidebar-foreground tracking-wide truncate">
-            Conversations
-          </span>
+    <>
+      {/* Mobile backdrop */}
+      <div
+        className={cn(
+          "fixed inset-0 z-30 bg-black/40 backdrop-blur-[1px] transition-opacity md:hidden",
+          mobileOpen ? "opacity-100" : "pointer-events-none opacity-0"
         )}
-        <div className={cn("flex items-center gap-1", collapsed && "w-full justify-center")}>
-          <Button
-            variant="ghost"
-            size="icon"
-            onClick={onNew}
-            className="h-8 w-8 rounded-lg hover:bg-sidebar-accent"
-            title="New conversation"
-          >
-            <Plus className="h-4 w-4" />
-          </Button>
-        </div>
-      </div>
+        onClick={onMobileClose}
+        aria-hidden
+      />
 
-      {/* Search */}
-      {!collapsed && (
-        <div className="px-3 py-2">
-          <div className="relative">
-            <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground" />
+      <aside
+        className={cn(
+          "fixed inset-y-0 left-0 z-40 flex w-[280px] flex-col border-r border-sidebar-border bg-sidebar text-sidebar-foreground transition-[transform,width] duration-300 ease-in-out",
+          "md:static md:z-auto md:translate-x-0",
+          mobileOpen ? "translate-x-0 shadow-xl" : "-translate-x-full",
+          collapsed ? "md:w-[60px]" : "md:w-[280px]"
+        )}
+        aria-label="Conversations"
+      >
+        {/* Brand row */}
+        <div className="flex h-14 shrink-0 items-center gap-2 px-3">
+          <div className={cn("flex min-w-0 flex-1 items-center gap-2.5", collapsed && "md:hidden")}>
+            <BrandMark size="sm" />
+            <div className="min-w-0 leading-tight">
+              <p className="truncate text-sm font-semibold">{agentLabel}</p>
+              <p className="truncate text-[11px] text-muted-foreground">Texas Tech University</p>
+            </div>
+          </div>
+          <IconButton
+            label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
+            onClick={onToggle}
+            className={cn("hidden md:inline-flex", collapsed && "mx-auto")}
+          >
+            {collapsed ? <PanelLeftOpen className="h-4 w-4" /> : <PanelLeftClose className="h-4 w-4" />}
+          </IconButton>
+          <IconButton label="Close sidebar" onClick={onMobileClose} className="md:hidden">
+            <X className="h-4 w-4" />
+          </IconButton>
+        </div>
+
+        {/* New chat + search */}
+        <div className={cn("space-y-2 px-3 pb-2", collapsed && "md:px-2")}>
+          {collapsed ? (
+            <IconButton label="New chat" onClick={onNew} className="hidden md:mx-auto md:flex">
+              <SquarePen className="h-4 w-4" />
+            </IconButton>
+          ) : null}
+          <button
+            type="button"
+            onClick={onNew}
+            className={cn(
+              "flex h-9 w-full items-center gap-2 rounded-lg border border-sidebar-border bg-background px-3 text-sm font-medium shadow-xs transition-colors hover:bg-sidebar-accent",
+              collapsed && "md:hidden"
+            )}
+          >
+            <SquarePen className="h-4 w-4 text-muted-foreground" />
+            New chat
+          </button>
+          <div className={cn("relative", collapsed && "md:hidden")}>
+            <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
             <input
               type="text"
-              placeholder="Search..."
+              placeholder="Search chats"
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
-              className="w-full pl-8 pr-3 py-1.5 text-sm rounded-md bg-sidebar-accent/50 border border-border placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-ring text-sidebar-foreground"
+              className="h-8 w-full rounded-lg bg-sidebar-accent/60 pl-8 pr-3 text-sm text-sidebar-foreground placeholder:text-muted-foreground focus:bg-background focus:outline-none focus:ring-2 focus:ring-ring"
             />
           </div>
         </div>
-      )}
 
-      {/* Conversation list */}
-      <ScrollArea className="flex-1">
-        <div className="px-2 py-1">
-          {collapsed ? (
-            <div className="flex flex-col gap-1">
-              {conversations.map((c) => (
-                <Button
-                  key={c.id}
-                  variant="ghost"
-                  size="icon"
-                  onClick={() => onSelect(c.id)}
-                  className={cn(
-                    "h-9 w-9 rounded-lg mx-auto",
-                    activeId === c.id && "bg-sidebar-accent"
-                  )}
-                  title={c.title}
-                >
-                  <MessageSquare className="h-4 w-4" />
-                </Button>
-              ))}
-            </div>
+        {/* Conversation list */}
+        <nav className={cn("thin-scroll flex-1 overflow-y-auto px-2 pb-3", collapsed && "md:hidden")}>
+          {sections.length === 0 ? (
+            <p className="px-3 py-6 text-center text-xs text-muted-foreground">
+              {query ? "No chats match your search." : "Your conversations will appear here."}
+            </p>
           ) : (
-            Object.entries(grouped).map(([label, items]) => (
-              <div key={label} className="mb-3">
-                <p className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground px-2 mb-1">
-                  {label}
+            sections.map((section) => (
+              <div key={section.label} className="mt-3 first:mt-1">
+                <p className="mb-1 flex items-center gap-1.5 px-2.5 text-[11px] font-medium text-muted-foreground">
+                  {section.icon}
+                  {section.label}
                 </p>
-                {items.map((c) => (
-                  <ConversationItem
-                    key={c.id}
-                    conversation={c}
-                    active={c.id === activeId}
-                    onSelect={onSelect}
-                    onDelete={onDelete}
-                  />
+                {section.items.map((c) => (
+                  <ConversationItem key={c.id} conversation={c} active={c.id === activeId} {...itemHandlers} />
                 ))}
               </div>
             ))
           )}
-        </div>
-      </ScrollArea>
+        </nav>
+        {collapsed && <div className="hidden flex-1 md:block" />}
 
-      {/* Collapse toggle */}
-      <div className="p-2 border-t border-border">
-        <Button
-          variant="ghost"
-          size="icon"
-          onClick={onToggle}
-          className="h-8 w-8 rounded-lg hover:bg-sidebar-accent w-full"
-        >
-          {collapsed ? (
-            <ChevronRight className="h-4 w-4" />
-          ) : (
-            <ChevronLeft className="h-4 w-4" />
-          )}
-        </Button>
-      </div>
-    </aside>
+        <div className={cn("border-t border-sidebar-border px-4 py-3 text-[11px] leading-snug text-muted-foreground", collapsed && "md:hidden")}>
+          Chats are saved in this browser for 7 days.
+        </div>
+      </aside>
+    </>
   );
 }
+
+// ── Item ────────────────────────────────────────────────────────────────────
 
 function ConversationItem({
   conversation,
   active,
   onSelect,
   onDelete,
+  onTogglePin,
+  onToggleFavorite,
+  onRename,
 }: {
   conversation: Conversation;
   active: boolean;
   onSelect: (id: string) => void;
   onDelete: (id: string) => void;
+  onTogglePin: (id: string) => void;
+  onToggleFavorite: (id: string) => void;
+  onRename: (id: string, title: string) => void;
 }) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(conversation.title);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (!editing) return;
+    // Wait for the menu to finish closing so it doesn't steal focus back.
+    const t = setTimeout(() => inputRef.current?.select(), 30);
+    return () => clearTimeout(t);
+  }, [editing]);
+
+  const startEditing = () => {
+    setDraft(conversation.title);
+    setEditing(true);
+  };
+
+  const commit = () => {
+    const next = draft.trim();
+    if (next && next !== conversation.title) onRename(conversation.id, next);
+    setEditing(false);
+  };
+
+  if (editing) {
+    return (
+      <div className="px-1 py-0.5">
+        <input
+          ref={inputRef}
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          onBlur={commit}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") commit();
+            if (e.key === "Escape") setEditing(false);
+          }}
+          maxLength={80}
+          aria-label="Rename chat"
+          className="h-8 w-full rounded-md border border-ring bg-background px-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+        />
+      </div>
+    );
+  }
+
   return (
     <div
-      className={cn(
-        "group flex items-center gap-2 rounded-lg px-2 py-2 cursor-pointer hover:bg-sidebar-accent transition-colors",
-        active && "bg-sidebar-accent"
-      )}
+      role="button"
+      tabIndex={0}
       onClick={() => onSelect(conversation.id)}
-    >
-      <MessageSquare className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-      <div className="flex-1 min-w-0">
-        <p className="text-sm font-medium text-sidebar-foreground truncate leading-tight">
-          {conversation.title}
-        </p>
-        <p className="text-[11px] text-muted-foreground truncate">
-          {conversation.lastMessage}
-        </p>
-      </div>
-      {conversation.unread && (
-        <Badge className="h-4 w-4 p-0 flex items-center justify-center text-[10px] shrink-0 bg-primary text-primary-foreground">
-          {conversation.unread}
-        </Badge>
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          onSelect(conversation.id);
+        }
+      }}
+      onDoubleClick={startEditing}
+      className={cn(
+        "group relative flex h-9 cursor-pointer items-center gap-2 rounded-lg px-2.5 text-sm outline-none transition-colors",
+        "hover:bg-sidebar-accent focus-visible:ring-2 focus-visible:ring-ring",
+        active && "bg-sidebar-accent font-medium"
       )}
+      title={conversation.title}
+    >
+      <span className="min-w-0 flex-1 truncate">{conversation.title}</span>
+
       <DropdownMenu>
         <DropdownMenuTrigger
-          className="inline-flex items-center justify-center h-6 w-6 rounded-md opacity-0 group-hover:opacity-100 shrink-0 hover:bg-accent transition-colors"
+          className={cn(
+            "inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-muted-foreground transition hover:bg-background hover:text-foreground",
+            "opacity-0 group-hover:opacity-100 focus-visible:opacity-100 data-[popup-open]:opacity-100",
+            active && "opacity-100"
+          )}
           onClick={(e) => e.stopPropagation()}
+          aria-label="Chat options"
         >
-          <MoreHorizontal className="h-3.5 w-3.5" />
+          <MoreHorizontal className="h-4 w-4" />
         </DropdownMenuTrigger>
-        <DropdownMenuContent align="end" className="w-36">
+        <DropdownMenuContent align="start" className="w-48">
           <DropdownMenuItem
-            className="text-destructive focus:text-destructive gap-2"
+            className="gap-2"
+            onClick={(e) => {
+              e.stopPropagation();
+              onTogglePin(conversation.id);
+            }}
+          >
+            {conversation.pinned ? <PinOff className="h-4 w-4" /> : <Pin className="h-4 w-4" />}
+            {conversation.pinned ? "Unpin" : "Pin"}
+          </DropdownMenuItem>
+          <DropdownMenuItem
+            className="gap-2"
+            onClick={(e) => {
+              e.stopPropagation();
+              onToggleFavorite(conversation.id);
+            }}
+          >
+            {conversation.favorite ? <StarOff className="h-4 w-4" /> : <Star className="h-4 w-4" />}
+            {conversation.favorite ? "Remove from favorites" : "Add to favorites"}
+          </DropdownMenuItem>
+          <DropdownMenuItem
+            className="gap-2"
+            onClick={(e) => {
+              e.stopPropagation();
+              startEditing();
+            }}
+          >
+            <Pencil className="h-4 w-4" />
+            Rename
+          </DropdownMenuItem>
+          <DropdownMenuSeparator />
+          <DropdownMenuItem
+            variant="destructive"
+            className="gap-2"
             onClick={(e) => {
               e.stopPropagation();
               onDelete(conversation.id);
             }}
           >
-            <Trash2 className="h-3.5 w-3.5" />
+            <Trash2 className="h-4 w-4" />
             Delete
           </DropdownMenuItem>
         </DropdownMenuContent>
@@ -210,7 +314,54 @@ function ConversationItem({
   );
 }
 
-function groupByDate(conversations: Conversation[]): Record<string, Conversation[]> {
+function IconButton({
+  label,
+  onClick,
+  className,
+  children,
+}: {
+  label: string;
+  onClick: () => void;
+  className?: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <Tooltip>
+      <TooltipTrigger
+        onClick={onClick}
+        aria-label={label}
+        className={cn(
+          "inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-sidebar-accent hover:text-foreground",
+          className
+        )}
+      >
+        {children}
+      </TooltipTrigger>
+      <TooltipContent side="right" className="text-xs">
+        {label}
+      </TooltipContent>
+    </Tooltip>
+  );
+}
+
+// ── Grouping ──────────────────────────────────────────────────────────────────
+
+interface Section {
+  label: string;
+  icon?: React.ReactNode;
+  items: Conversation[];
+}
+
+function buildSections(conversations: Conversation[]): Section[] {
+  const pinned = conversations.filter((c) => c.pinned);
+  const favorites = conversations.filter((c) => !c.pinned && c.favorite);
+  const rest = conversations.filter((c) => !c.pinned && !c.favorite);
+
+  const sections: Section[] = [];
+  if (pinned.length) sections.push({ label: "Pinned", icon: <Pin className="h-3 w-3" />, items: pinned });
+  if (favorites.length)
+    sections.push({ label: "Favorites", icon: <Star className="h-3 w-3" />, items: favorites });
+
   const now = new Date();
   const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
   const yesterday = new Date(today);
@@ -218,19 +369,16 @@ function groupByDate(conversations: Conversation[]): Record<string, Conversation
   const sevenDaysAgo = new Date(today);
   sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
 
-  const groups: Record<string, Conversation[]> = {};
-
-  for (const c of conversations) {
+  const byDate: Record<string, Conversation[]> = {};
+  const order = ["Today", "Yesterday", "Previous 7 days", "Older"];
+  for (const c of rest) {
     const d = new Date(c.updatedAt);
-    let label: string;
-    if (d >= today) label = "Today";
-    else if (d >= yesterday) label = "Yesterday";
-    else if (d >= sevenDaysAgo) label = "Past 7 days";
-    else label = "Older";
-
-    if (!groups[label]) groups[label] = [];
-    groups[label].push(c);
+    const label =
+      d >= today ? "Today" : d >= yesterday ? "Yesterday" : d >= sevenDaysAgo ? "Previous 7 days" : "Older";
+    (byDate[label] ??= []).push(c);
   }
-
-  return groups;
+  for (const label of order) {
+    if (byDate[label]?.length) sections.push({ label, items: byDate[label] });
+  }
+  return sections;
 }

@@ -7,6 +7,12 @@ export interface Message {
   timestamp: Date;
   isStreaming?: boolean;
   imageIds?: string[];
+  error?: boolean;
+  /** Id of the backend log record for this answer (from X-Log-Id). */
+  logId?: string;
+  /** UTC date of that log record (from X-Log-Date). */
+  logDate?: string;
+  feedback?: "up" | "down";
 }
 
 export interface Conversation {
@@ -16,4 +22,6 @@ export interface Conversation {
   lastMessage: string;
   updatedAt: Date;
   unread?: number;
+  pinned?: boolean;
+  favorite?: boolean;
 }

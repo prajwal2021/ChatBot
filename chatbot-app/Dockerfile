@@ -7,7 +7,10 @@ FROM node:20-alpine AS builder
 WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
-ARG NEXT_PUBLIC_API_URL=http://localhost:8000
+# Baked into the client bundle by `npm run build`, so it must be an ARG set
+# before the build step — a runtime ENV cannot change an already-built bundle.
+# No localhost default: behind nginx the backend is a sibling subpath.
+ARG NEXT_PUBLIC_API_URL=/chatbot-api
 ENV NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL
 RUN npm run build
 

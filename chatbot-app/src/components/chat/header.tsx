@@ -1,44 +1,59 @@
 "use client";
 
-import { Bot } from "lucide-react";
+import { Menu, SquarePen } from "lucide-react";
 import { ThemeToggle } from "@/components/theme-toggle";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 
 interface ChatHeaderProps {
   conversationTitle: string;
-  agentTitle: string;
+  assistantName: string;
+  onOpenSidebar: () => void;
+  onNewChat: () => void;
 }
 
-export function ChatHeader({ conversationTitle, agentTitle }: ChatHeaderProps) {
+export function ChatHeader({ conversationTitle, assistantName, onOpenSidebar, onNewChat }: ChatHeaderProps) {
   return (
-    <header className="flex items-center justify-between px-4 h-14 border-b border-border bg-background/80 backdrop-blur-sm sticky top-0 z-10">
-      {/* Left — bot avatar + conversation title */}
-      <div className="flex items-center gap-3 min-w-0">
-        <div className="flex items-center justify-center h-8 w-8 rounded-full bg-primary shrink-0">
-          <Bot className="h-4 w-4 text-primary-foreground" />
-        </div>
-        <div className="min-w-0">
-          <h1 className="text-sm font-semibold text-foreground truncate leading-tight">
-            {conversationTitle}
-          </h1>
-          <div className="flex items-center gap-1.5">
-            <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 shrink-0" />
-            <span className="text-[11px] text-muted-foreground">Online</span>
-          </div>
-        </div>
+    <header className="sticky top-0 z-20 flex h-14 shrink-0 items-center gap-2 border-b border-border/70 bg-background/85 px-3 backdrop-blur-md md:px-5">
+      <HeaderButton label="Open sidebar" onClick={onOpenSidebar} className="md:hidden">
+        <Menu className="h-[18px] w-[18px]" />
+      </HeaderButton>
+
+      <div className="min-w-0 flex-1">
+        <p className="truncate text-sm font-semibold leading-tight text-foreground">{assistantName}</p>
+        <p className="truncate text-xs leading-tight text-muted-foreground">{conversationTitle}</p>
       </div>
 
-      {/* Centre — agent title badge */}
-      <div className="absolute left-1/2 -translate-x-1/2 pointer-events-none select-none">
-        <div className="flex items-center gap-2 bg-primary/8 border border-primary/15 rounded-full px-3.5 py-1">
-          <span className="w-1.5 h-1.5 rounded-full bg-primary shrink-0" />
-          <span className="text-xs font-semibold tracking-widest uppercase text-primary whitespace-nowrap">
-            {agentTitle}
-          </span>
-        </div>
-      </div>
-
-      {/* Right — theme toggle */}
+      <HeaderButton label="New chat" onClick={onNewChat} className="md:hidden">
+        <SquarePen className="h-4 w-4" />
+      </HeaderButton>
       <ThemeToggle />
     </header>
+  );
+}
+
+function HeaderButton({
+  label,
+  onClick,
+  className,
+  children,
+}: {
+  label: string;
+  onClick: () => void;
+  className?: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <Tooltip>
+      <TooltipTrigger
+        onClick={onClick}
+        aria-label={label}
+        className={`inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-accent hover:text-foreground ${className ?? ""}`}
+      >
+        {children}
+      </TooltipTrigger>
+      <TooltipContent side="bottom" className="text-xs">
+        {label}
+      </TooltipContent>
+    </Tooltip>
   );
 }

@@ -1,12 +1,17 @@
 "use client";
 
 import { useParams, useRouter } from "next/navigation";
-import { useRef, useState, useCallback, useEffect } from "react";
+import { useRef, useState, useCallback, useEffect, useMemo } from "react";
+import { ArrowDown } from "lucide-react";
 import { Sidebar } from "@/components/chat/sidebar";
 import { ChatHeader } from "@/components/chat/header";
 import { MessageBubble } from "@/components/chat/message";
 import { InputArea } from "@/components/chat/input-area";
+import { EmptyState } from "@/components/chat/empty-state";
+import { ChatNavigator } from "@/components/chat/chat-navigator";
 import { Conversation, Message } from "@/types/chat";
+import { API_URL } from "@/lib/api";
+import { getAgentMeta } from "@/lib/agents";
 
 // ── Storage (per agent) ────────────────────────────────────────────────────────
 
@@ -16,21 +21,16 @@ function generateId() {
   return Math.random().toString(36).slice(2, 11);
 }
 
-// Display names for greeting text — keyed by agent ID
-const AGENT_DISPLAY: Record<string, string> = {
-  "ttu-online": "TTU Online",
-  "k12": "K-12",
-  "online_chat": "TTU Online",
-  "k12_chat": "K-12",
-};
+const NEW_CHAT_TITLE = "New chat";
+const SIDEBAR_KEY = "ttu_chat_sidebar_collapsed";
 
-function freshConversation(agentId: string): Conversation {
+function freshConversation(): Conversation {
   return {
     id: generateId(),
-    title: "New conversation",
+    title: NEW_CHAT_TITLE,
     lastMessage: "",
     updatedAt: new Date(),
-    messages: [], // greeting is animated in via useEffect
+    messages: [],
   };
 }
 
@@ -86,15 +86,32 @@ export default function AgentChatPage() {
   const [activeId, setActiveId] = useState("");
   const [hydrated, setHydrated] = useState(false);
   const [isStreaming, setIsStreaming] = useState(false);
-  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
+    try {
+      return typeof window !== "undefined" && localStorage.getItem(SIDEBAR_KEY) === "1";
+    } catch {
+      return false;
+    }
+  });
+  const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
+  const [showScrollDown, setShowScrollDown] = useState(false);
+  const [activeQuestionId, setActiveQuestionId] = useState<string | null>(null);
   const streamingRef = useRef(false);
-  const messagesEndRef = useRef<HTMLDivElement>(null);
-  const greetedRef = useRef<Set<string>>(new Set());
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const nearBottomRef = useRef(true);
+
+  const meta = getAgentMeta(agentId, displayName);
+
+  const toggleSidebar = useCallback(() => {
+    setSidebarCollapsed((v) => {
+      try { localStorage.setItem(SIDEBAR_KEY, v ? "0" : "1"); } catch { /* ignore */ }
+      return !v;
+    });
+  }, []);
 
   // Fetch agent display name + validate agent exists
   useEffect(() => {
-    const apiUrl = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
-    fetch(`${apiUrl}/agents`)
+    fetch(`${API_URL}/agents`)
       .then((r) => r.json())
       .then((agents: { id: string; display_name: string; kb_last_updated?: string | null }[]) => {
         const found = agents.find((a) => a.id === agentId);
@@ -122,7 +139,7 @@ export default function AgentChatPage() {
       setConversations(saved.conversations);
       setActiveId(saved.activeId);
     } else {
-      const conv = freshConversation(agentId);
+      const conv = freshConversation();
       setConversations([conv]);
       setActiveId(conv.id);
     }
@@ -136,99 +153,63 @@ export default function AgentChatPage() {
     }
   }, [agentId, conversations, activeId, hydrated]);
 
-  // ── Animated greeting for every new empty conversation ──────────────────────
-  const activeConvId = conversations.find((c) => c.id === activeId)?.id;
-  const activeConvMsgCount = conversations.find((c) => c.id === activeId)?.messages.length ?? -1;
-
-  useEffect(() => {
-    if (!hydrated || !activeConvId) return;
-    if (activeConvMsgCount !== 0) return;               // already has messages
-    if (greetedRef.current.has(activeConvId)) return;   // already greeted this conv
-
-    greetedRef.current.add(activeConvId);
-    const convId = activeConvId;
-    const name = AGENT_DISPLAY[agentId] ?? agentId;
-    const msg1Id = generateId();
-    const msg2Id = generateId();
-    const fullText = `I'm your ${name} assistant. How can I help you today?`;
-
-    let aborted = false;
-
-    // Step 1 — first message appears after a short pause
-    const t1 = setTimeout(() => {
-      if (aborted) return;
-      setConversations((prev) =>
-        prev.map((c) =>
-          c.id === convId
-            ? {
-                ...c,
-                messages: [
-                  { id: msg1Id, role: "assistant" as const, content: "Hi there! 👋", timestamp: new Date() },
-                ],
-              }
-            : c
-        )
-      );
-
-      // Step 2 — typing indicator appears
-      const t2 = setTimeout(() => {
-        if (aborted) return;
-        setConversations((prev) =>
-          prev.map((c) =>
-            c.id !== convId
-              ? c
-              : {
-                  ...c,
-                  messages: [
-                    ...c.messages,
-                    { id: msg2Id, role: "assistant" as const, content: "", timestamp: new Date(), isStreaming: true },
-                  ],
-                }
-          )
-        );
-
-        // Step 3 — type out the second message
-        let i = 0;
-        const interval = setInterval(() => {
-          if (aborted) { clearInterval(interval); return; }
-          i += 3;
-          const done = i >= fullText.length;
-          setConversations((prev) =>
-            prev.map((c) =>
-              c.id !== convId
-                ? c
-                : {
-                    ...c,
-                    messages: c.messages.map((m) =>
-                      m.id === msg2Id
-                        ? { ...m, content: fullText.slice(0, Math.min(i, fullText.length)), isStreaming: !done }
-                        : m
-                    ),
-                  }
-            )
-          );
-          if (done) clearInterval(interval);
-        }, 28);
-      }, 700);
-
-      return () => clearTimeout(t2);
-    }, 450);
-
-    return () => {
-      aborted = true;
-      clearTimeout(t1);
-    };
-  }, [hydrated, activeConvId, agentId]); // eslint-disable-line react-hooks/exhaustive-deps
-
   const activeConversation = conversations.find((c) => c.id === activeId);
+  const messages = useMemo(() => activeConversation?.messages ?? [], [activeConversation]);
+  const lastMessage = messages[messages.length - 1];
 
-  const scrollToBottom = useCallback(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  const questions = useMemo(
+    () =>
+      messages
+        .filter((m) => m.role === "user")
+        .map((m) => ({ id: m.id, label: m.content.length > 140 ? m.content.slice(0, 140) + "…" : m.content })),
+    [messages]
+  );
+
+  // ── Scrolling ─────────────────────────────────────────────────────────────
+  const updateScrollState = useCallback(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const distance = el.scrollHeight - el.scrollTop - el.clientHeight;
+    nearBottomRef.current = distance < 120;
+    setShowScrollDown(distance > 240);
+
+    // The current question is the last one whose top has scrolled past the
+    // upper third of the viewport.
+    const top = el.getBoundingClientRect().top;
+    let current: string | null = null;
+    el.querySelectorAll<HTMLElement>("[data-user-message]").forEach((node) => {
+      if (node.getBoundingClientRect().top - top <= el.clientHeight * 0.35) {
+        current = node.dataset.userMessage ?? null;
+      }
+    });
+    setActiveQuestionId(current ?? questions[0]?.id ?? null);
+  }, [questions]);
+
+  const scrollToBottom = useCallback((behavior: ScrollBehavior = "smooth") => {
+    const el = scrollRef.current;
+    if (!el) return;
+    nearBottomRef.current = true;
+    el.scrollTo({ top: el.scrollHeight, behavior });
   }, []);
 
+  // Jump to the latest message when switching conversations.
   useEffect(() => {
-    scrollToBottom();
-  }, [activeConversation?.messages.length, scrollToBottom]);
+    requestAnimationFrame(() => {
+      scrollToBottom("auto");
+      updateScrollState();
+    });
+  }, [activeId, hydrated]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Follow the answer while it streams, unless the reader has scrolled up.
+  useEffect(() => {
+    if (nearBottomRef.current) scrollToBottom("auto");
+    updateScrollState();
+  }, [messages.length, lastMessage?.content]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const jumpToQuestion = useCallback((id: string) => {
+    const node = scrollRef.current?.querySelector(`#msg-${CSS.escape(id)}`);
+    node?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }, []);
 
   const handleSend = useCallback(
     async (text: string) => {
@@ -259,8 +240,8 @@ export default function AgentChatPage() {
                 lastMessage: text,
                 updatedAt: new Date(),
                 title:
-                  c.messages.filter((m) => m.role === "user").length === 0
-                    ? text.slice(0, 40) + (text.length > 40 ? "..." : "")
+                  c.messages.filter((m) => m.role === "user").length === 0 && c.title === NEW_CHAT_TITLE
+                    ? text.slice(0, 48) + (text.length > 48 ? "…" : "")
                     : c.title,
               }
             : c
@@ -269,16 +250,15 @@ export default function AgentChatPage() {
 
       setIsStreaming(true);
       streamingRef.current = true; //preventing me to send another msg while waiting for response
+      nearBottomRef.current = true;
 
       try {
-        const apiUrl = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000"; //backend
-
         // Build the full history from the conversation before adding the current message.
         const historyMessages = (activeConversation?.messages ?? [])
           .filter((m) => m.content.trim() && !m.isStreaming)
           .map((m) => ({ role: m.role as "user" | "assistant", content: m.content }));
 
-        const res = await fetch(`${apiUrl}/chat/${agentId}`, { //api call hit with msg and history
+        const res = await fetch(`${API_URL}/chat/${agentId}`, { //api call hit with msg and history
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -289,6 +269,8 @@ export default function AgentChatPage() {
         });
 
         if (!res.ok || !res.body) throw new Error("API error");
+        const logId = res.headers.get("X-Log-Id") ?? undefined;
+        const logDate = res.headers.get("X-Log-Date") ?? undefined;
 
         const reader = res.body.getReader();
         const decoder = new TextDecoder();
@@ -337,7 +319,7 @@ export default function AgentChatPage() {
                   ...c,
                   messages: c.messages.map((m) =>
                     m.id === assistantMsgId
-                      ? { ...m, content: finalContent, imageIds, isStreaming: false }
+                      ? { ...m, content: finalContent, imageIds, isStreaming: false, logId, logDate }
                       : m
                   ),
                 }
@@ -354,7 +336,8 @@ export default function AgentChatPage() {
                     m.id === assistantMsgId
                       ? {
                           ...m,
-                          content: "Failed to reach the knowledge base. Please check your connection.",
+                          content: "Couldn't reach the assistant. Check your connection and try again.",
+                          error: true,
                           isStreaming: false,
                         }
                       : m
@@ -377,16 +360,31 @@ export default function AgentChatPage() {
     setConversations((prev) =>
       prev.map((c) =>
         c.id === activeId
-          ? { ...c, messages: c.messages.map((m) => (m.isStreaming ? { ...m, isStreaming: false } : m)) }
+          ? {
+              ...c,
+              messages: c.messages.map((m) =>
+                m.isStreaming
+                  ? { ...m, isStreaming: false, content: m.content || "_Response stopped._" }
+                  : m
+              ),
+            }
           : c
       )
     );
   }, [activeId]);
 
   const handleNew = useCallback(() => {
-    const conv = freshConversation(agentId);
+    setMobileSidebarOpen(false);
+    // Reuse the current chat if nothing has been asked in it yet.
+    if (activeConversation && activeConversation.messages.length === 0) return;
+    const conv = freshConversation();
     setConversations((prev) => [conv, ...prev]);
     setActiveId(conv.id);
+  }, [activeConversation]);
+
+  const handleSelect = useCallback((id: string) => {
+    setActiveId(id);
+    setMobileSidebarOpen(false);
   }, []);
 
   const handleDelete = useCallback(
@@ -394,10 +392,11 @@ export default function AgentChatPage() {
       setConversations((prev) => {
         const next = prev.filter((c) => c.id !== id);
         if (activeId === id) {
-          if (next.length > 0) {
-            setActiveId(next[0].id);
+          const fallback = next.find((c) => c.messages.length > 0) ?? next[0];
+          if (fallback) {
+            setActiveId(fallback.id);
           } else {
-            const conv = freshConversation(agentId);
+            const conv = freshConversation();
             setActiveId(conv.id);
             return [conv];
           }
@@ -406,6 +405,60 @@ export default function AgentChatPage() {
       });
     },
     [activeId]
+  );
+
+  const updateConversation = useCallback((id: string, patch: (c: Conversation) => Partial<Conversation>) => {
+    setConversations((prev) => prev.map((c) => (c.id === id ? { ...c, ...patch(c) } : c)));
+  }, []);
+
+  const handleTogglePin = useCallback(
+    (id: string) => updateConversation(id, (c) => ({ pinned: !c.pinned })),
+    [updateConversation]
+  );
+  const handleToggleFavorite = useCallback(
+    (id: string) => updateConversation(id, (c) => ({ favorite: !c.favorite })),
+    [updateConversation]
+  );
+  const handleRename = useCallback(
+    (id: string, title: string) => updateConversation(id, () => ({ title })),
+    [updateConversation]
+  );
+
+  const handleFeedback = useCallback(
+    (messageId: string, value: "up" | "down" | null) => {
+      const target = activeConversation?.messages.find((m) => m.id === messageId);
+      if (!target?.logId || !target.logDate) return;
+      const convId = activeId;
+      setConversations((prev) =>
+        prev.map((c) =>
+          c.id === convId
+            ? {
+                ...c,
+                messages: c.messages.map((m) =>
+                  m.id === messageId ? { ...m, feedback: value ?? undefined } : m
+                ),
+              }
+            : c
+        )
+      );
+      const body = JSON.stringify({
+        log_id: target.logId,
+        log_date: target.logDate,
+        feedback_type: value === "up" ? "thumbs_up" : value === "down" ? "thumbs_down" : "cleared",
+      });
+      const send = () =>
+        fetch(`${API_URL}/feedback`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body,
+        });
+      // The answer's log record is written as the stream finishes, so a very
+      // quick click can arrive first (404) — retry once shortly after.
+      send()
+        .then((r) => (r.status === 404 ? new Promise((ok) => setTimeout(ok, 1500)).then(send) : r))
+        .catch(() => { /* feedback is best-effort */ });
+    },
+    [activeConversation, activeId]
   );
 
   const handleRegenerate = useCallback(() => {
@@ -427,53 +480,84 @@ export default function AgentChatPage() {
 
   if (!hydrated) return null;
 
+  const isEmpty = messages.length === 0;
+
   return (
-    <div className="flex h-screen bg-background overflow-hidden">
+    <div className="flex h-dvh overflow-hidden bg-background">
       <Sidebar
         conversations={conversations}
         activeId={activeId}
-        onSelect={setActiveId}
+        agentLabel={meta.label}
+        onSelect={handleSelect}
         onNew={handleNew}
         onDelete={handleDelete}
+        onTogglePin={handleTogglePin}
+        onToggleFavorite={handleToggleFavorite}
+        onRename={handleRename}
         collapsed={sidebarCollapsed}
-        onToggle={() => setSidebarCollapsed((v) => !v)}
+        onToggle={toggleSidebar}
+        mobileOpen={mobileSidebarOpen}
+        onMobileClose={() => setMobileSidebarOpen(false)}
       />
 
-      <div className="flex flex-col flex-1 min-w-0">
+      <main className="flex min-w-0 flex-1 flex-col">
         <ChatHeader
-          conversationTitle={activeConversation?.title ?? "New conversation"}
-          agentTitle={displayName}
+          assistantName={meta.assistantName}
+          conversationTitle={activeConversation?.title ?? NEW_CHAT_TITLE}
+          onOpenSidebar={() => setMobileSidebarOpen(true)}
+          onNewChat={handleNew}
         />
 
-        <div className="flex-1 overflow-y-auto scroll-smooth">
-          <div className="max-w-3xl mx-auto py-4 pb-2">
-            {activeConversation?.messages.map((msg, i) => (
-              <MessageBubble
-                key={msg.id}
-                message={msg}
-                onRegenerate={
-                  i === (activeConversation?.messages.length ?? 0) - 1 &&
-                  msg.role === "assistant" &&
-                  !msg.isStreaming
-                    ? handleRegenerate
-                    : undefined
-                }
-              />
-            ))}
-            <div ref={messagesEndRef} />
+        <div className="relative min-h-0 flex-1">
+          <div ref={scrollRef} onScroll={updateScrollState} className="thin-scroll h-full overflow-y-auto">
+            {isEmpty ? (
+              <EmptyState meta={meta} onSuggestion={handleSend} />
+            ) : (
+              <div className="mx-auto max-w-3xl py-6">
+                {messages.map((msg, i) => {
+                  const isLast = i === messages.length - 1;
+                  return (
+                    <MessageBubble
+                      key={msg.id}
+                      message={msg}
+                      isLast={isLast && msg.role === "assistant"}
+                      onRegenerate={
+                        isLast && msg.role === "assistant" && !msg.isStreaming ? handleRegenerate : undefined
+                      }
+                      onFeedback={handleFeedback}
+                    />
+                  );
+                })}
+              </div>
+            )}
           </div>
+
+          <ChatNavigator items={questions} activeId={activeQuestionId} onJump={jumpToQuestion} />
+
+          {showScrollDown && (
+            <button
+              type="button"
+              onClick={() => scrollToBottom()}
+              aria-label="Scroll to latest message"
+              className="absolute bottom-3 left-1/2 inline-flex h-9 w-9 -translate-x-1/2 items-center justify-center rounded-full border border-border bg-background text-foreground shadow-md transition hover:bg-accent animate-in fade-in zoom-in-95"
+            >
+              <ArrowDown className="h-4 w-4" />
+            </button>
+          )}
         </div>
 
-        <div className="max-w-3xl mx-auto w-full">
+        <div className="mx-auto w-full max-w-3xl">
           <InputArea
             onSend={handleSend}
             disabled={isStreaming}
             isStreaming={isStreaming}
             onStop={handleStop}
             kbLastUpdated={kbLastUpdated}
+            placeholder={`Message ${meta.assistantName}`}
+            focusKey={activeId}
           />
         </div>
-      </div>
+      </main>
     </div>
   );
 }

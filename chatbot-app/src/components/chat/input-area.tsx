@@ -1,8 +1,7 @@
 "use client";
 
-import { useRef, useState, KeyboardEvent } from "react";
-import { Send, Square } from "lucide-react";
-import { Button } from "@/components/ui/button";
+import { useEffect, useRef, useState, KeyboardEvent } from "react";
+import { ArrowUp, Square } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 interface InputAreaProps {
@@ -11,87 +10,109 @@ interface InputAreaProps {
   isStreaming?: boolean;
   onStop?: () => void;
   kbLastUpdated?: string | null;
+  placeholder?: string;
+  /** Changes whenever the active conversation changes, to re-focus the box. */
+  focusKey?: string;
 }
 
-export function InputArea({ onSend, disabled, isStreaming, onStop, kbLastUpdated }: InputAreaProps) {
+const MAX_HEIGHT = 200;
+
+export function InputArea({
+  onSend,
+  disabled,
+  isStreaming,
+  onStop,
+  kbLastUpdated,
+  placeholder = "Ask a question…",
+  focusKey,
+}: InputAreaProps) {
   const [value, setValue] = useState("");
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+  useEffect(() => {
+    // Don't pop the on-screen keyboard open on touch devices.
+    if (window.matchMedia("(pointer: fine)").matches) textareaRef.current?.focus();
+  }, [focusKey]);
+
+  const resize = () => {
+    const el = textareaRef.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = Math.min(el.scrollHeight, MAX_HEIGHT) + "px";
+  };
 
   const handleSend = () => {
     const trimmed = value.trim();
     if (!trimmed || disabled) return;
     onSend(trimmed);
     setValue("");
-    if (textareaRef.current) {
-      textareaRef.current.style.height = "auto";
-    }
+    requestAnimationFrame(resize);
   };
 
   const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
-    if (e.key === "Enter" && !e.shiftKey) {
+    if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
       e.preventDefault();
       handleSend();
     }
   };
 
-  const handleInput = () => {
-    const el = textareaRef.current;
-    if (!el) return;
-    el.style.height = "auto";
-    el.style.height = Math.min(el.scrollHeight, 180) + "px";
-  };
-
   const canSend = value.trim().length > 0 && !disabled;
 
   return (
-    <div className="px-4 pb-4 pt-2">
-      <div className="relative flex items-end gap-2 rounded-2xl border border-border bg-card shadow-sm focus-within:ring-2 focus-within:ring-ring/50 transition-shadow px-4">
+    <div className="px-3 pb-3 pt-2 sm:px-6 sm:pb-4">
+      <div
+        className={cn(
+          "flex items-end gap-2 rounded-[1.6rem] border border-input bg-card py-2 pl-5 pr-2 shadow-sm transition-[box-shadow,border-color]",
+          "focus-within:border-foreground/20 focus-within:shadow-md"
+        )}
+      >
         <textarea
           ref={textareaRef}
           value={value}
-          onChange={(e) => setValue(e.target.value)}
-          onInput={handleInput}
+          onChange={(e) => {
+            setValue(e.target.value);
+            resize();
+          }}
           onKeyDown={handleKeyDown}
-          placeholder="Ask your knowledge base..."
+          placeholder={placeholder}
           rows={1}
-          disabled={disabled}
-          className="flex-1 resize-none bg-transparent py-3 text-sm text-foreground placeholder:text-muted-foreground focus:outline-none min-h-[44px] max-h-[180px] leading-relaxed"
+          aria-label="Message"
+          className="thin-scroll max-h-[200px] min-h-[40px] flex-1 resize-none bg-transparent py-2 text-[0.9375rem] leading-relaxed text-foreground placeholder:text-muted-foreground focus:outline-none"
         />
 
-        <div className="flex items-center mb-1.5 shrink-0">
-          {isStreaming ? (
-            <Button
-              size="icon"
-              className="h-9 w-9 rounded-xl bg-destructive hover:bg-destructive/90 text-white"
-              onClick={onStop}
-            >
-              <Square className="h-3.5 w-3.5 fill-current" />
-            </Button>
-          ) : (
-            <Button
-              size="icon"
-              className={cn(
-                "h-9 w-9 rounded-xl transition-all duration-200",
-                canSend
-                  ? "bg-primary hover:bg-primary/90 text-primary-foreground shadow-sm"
-                  : "bg-muted text-muted-foreground cursor-not-allowed"
-              )}
-              disabled={!canSend}
-              onClick={handleSend}
-            >
-              <Send className="h-4 w-4" />
-            </Button>
-          )}
-        </div>
-      </div>
-      <div className="mt-2 flex flex-wrap items-center justify-center gap-x-2 text-center text-[10px] leading-tight text-muted-foreground">
-        <span>Responses are based on connected knowledge bases only.</span>
-        {kbLastUpdated && (
-          <span className="whitespace-nowrap opacity-80">
-            Last updated KB: {kbLastUpdated}
-          </span>
+        {isStreaming ? (
+          <button
+            type="button"
+            onClick={onStop}
+            aria-label="Stop generating"
+            title="Stop generating"
+            className="mb-0.5 inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-foreground text-background transition-opacity hover:opacity-85"
+          >
+            <Square className="h-3 w-3 fill-current" />
+          </button>
+        ) : (
+          <button
+            type="button"
+            onClick={handleSend}
+            disabled={!canSend}
+            aria-label="Send message"
+            title="Send message"
+            className={cn(
+              "mb-0.5 inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full transition-all",
+              canSend
+                ? "bg-primary text-primary-foreground shadow-sm hover:brightness-110"
+                : "cursor-not-allowed bg-muted text-muted-foreground"
+            )}
+          >
+            <ArrowUp className="h-[18px] w-[18px]" strokeWidth={2.25} />
+          </button>
         )}
       </div>
+
+      <p className="mt-2 px-2 text-center text-[11px] leading-snug text-muted-foreground">
+        Answers come from official TTU information and can still contain mistakes. Please verify important details.
+        {kbLastUpdated && <span className="whitespace-nowrap"> · Updated {kbLastUpdated}</span>}
+      </p>
     </div>
   );
 }
