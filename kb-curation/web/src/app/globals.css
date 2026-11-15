@@ -1,0 +1,24 @@
+@import "tailwindcss";
+
+@theme inline {
+  --font-sans: var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-mono), ui-monospace, SFMono-Regular, Menlo, monospace;
+  --color-ink: #0a0a0a;
+  --color-line: #ebebeb;
+  --color-subtle: #f7f7f7;
+  --color-muted: #6b6b6b;
+}
+
+html, body { height: 100%; }
+body { background: #fff; color: #0a0a0a; font-size: 14px; line-height: 1.5; -webkit-font-smoothing: antialiased; }
+* { border-color: #ebebeb; }
+::selection { background: #0a0a0a; color: #fff; }
+button { cursor: pointer; }
+button:disabled { cursor: not-allowed; }
+.scroll-thin { scrollbar-width: thin; scrollbar-color: #dcdcdc transparent; }
+@keyframes rise { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+.rise { animation: rise .18s ease-out; }
+@keyframes slidein { from { transform: translateX(24px); opacity: 0; } to { transform: none; opacity: 1; } }
+.slidein { animation: slidein .2s ease-out; }
+@keyframes stripes { to { background-position: 28px 0; } }
+.progress-live { background-image: linear-gradient(45deg, rgba(255,255,255,.25) 25%, transparent 25%, transparent 50%, rgba(255,255,255,.25) 50%, rgba(255,255,255,.25) 75%, transparent 75%); background-size: 28px 28px; animation: stripes .8s linear infinite; }
