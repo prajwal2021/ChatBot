@@ -26,15 +26,30 @@ QUEUE = ("new", "changed", "removal")
 def seed() -> None:
     db = SessionLocal()
     try:
-        if db.scalar(select(func.count()).select_from(Chatbot)):
-            return
-        for key, name, desc, url in (
-            ("k12", "TTU K-12", "Texas Tech K-12 chatbot for families, students and schools", "https://www.depts.ttu.edu/k12/"),
-            ("ttu-online", "TTU Online", "Texas Tech Online chatbot for prospective and current online students", "https://www.depts.ttu.edu/online/"),
-        ):
-            create_chatbot(db, key, name, desc, [url])
+        if not db.scalar(select(func.count()).select_from(Chatbot)):
+            for key, name, desc, url in (
+                ("k12", "TTU K-12", "Texas Tech K-12 chatbot for families, students and schools", "https://www.depts.ttu.edu/k12/"),
+                ("ttu-online", "TTU Online", "Texas Tech Online chatbot for prospective and current online students", "https://www.depts.ttu.edu/online/"),
+            ):
+                create_chatbot(db, key, name, desc, [url])
+        add_default_excludes(db)
     finally:
         db.close()
+
+
+# Staff directories are not chatbot knowledge. Added once (the activity line remembers it), so removing it on the
+# Sources page keeps it removed.
+DEFAULT_EXCLUDE = {"https://www.depts.ttu.edu/k12/": "/k12/about/staff/", "https://www.depts.ttu.edu/online/": "/online/about/staff/"}
+
+
+def add_default_excludes(db: Session) -> None:
+    for s in db.scalars(select(Source).where(Source.url.in_(DEFAULT_EXCLUDE))):
+        rule = DEFAULT_EXCLUDE[s.url]
+        if not db.scalar(select(Activity.id).where(Activity.chatbot_id == s.chatbot_id, Activity.detail["default"].astext == rule)):
+            s.exclude = [*(x for x in s.exclude or [] if x != rule), rule]
+            record(db, s.chatbot_id, "pages", "exclude_rules", "system",
+                   f"Now leaving out {rule} (staff directory). Remove it on the Sources page to crawl it.", source=s.url, default=rule)
+    db.commit()
 
 
 def create_chatbot(db: Session, key: str, name: str, desc: str, urls: list[str]) -> Chatbot:
