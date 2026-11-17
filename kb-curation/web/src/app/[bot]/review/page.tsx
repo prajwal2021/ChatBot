@@ -10,7 +10,7 @@ import { Badge, Button, CategoryChip, Empty, ErrorNote, inputCls, Loading, Stat,
 import { ago, cn, dateTime, DOT, pathOf } from "@/lib/utils";
 
 type Cats = { categories: Category[]; uncategorized: { total: number; waiting: number } };
-type Summary = { status: Record<EntryStatus, number>; labels: [string, number][] };
+type Summary = { status: Record<EntryStatus, number>; labels: [string, number][]; scope: { enabled: boolean; in: number; out: number; unchecked: number; clear: number } };
 type View = "queue" | "new" | "changed" | "removal" | "approved" | "rejected";
 
 export default function ReviewPage() {
@@ -25,6 +25,8 @@ function Inner() {
   const entryId = params.get("entry");
   const [view, setView] = useState<View>((params.get("status") as View) || "queue");
   const [cat, setCat] = useState<string>("");
+  const [scopeSel, setScopeSel] = useState<string | null>(params.get("scope"));
+  const topic = params.get("topic") ?? "";
   const [label, setLabel] = useState("");
   const [q, setQ] = useState("");
   const [dq, setDq] = useState("");
@@ -32,13 +34,17 @@ function Inner() {
   const [busy, setBusy] = useState(false);
   useEffect(() => { const t = setTimeout(() => setDq(q), 250); return () => clearTimeout(t); }, [q]);
 
+  const sum = useApi<Summary>(`/api/chatbots/${bot}/review-summary`);
+  const scopeOn = !!sum.data?.scope.enabled;
+  const scopeView = scopeSel ?? (scopeOn ? "in" : "");           // by default show only what Ryan's KB covers
   const qs = new URLSearchParams({ status: view });
+  if (scopeOn && scopeView) qs.set("scope", scopeView);
+  if (topic) qs.set("topic", topic);
   if (cat) qs.set("category", cat);
   if (label) qs.set("label", label);
   if (dq) qs.set("q", dq);
   const list = useApi<{ total: number; entries: Entry[] }>(`/api/chatbots/${bot}/entries?${qs}`);
   const cats = useApi<Cats>(`/api/chatbots/${bot}/categories`);
-  const sum = useApi<Summary>(`/api/chatbots/${bot}/review-summary`);
   const entries = list.data?.entries ?? [];
   const queueView = view !== "approved" && view !== "rejected";
   const catMap = useMemo(() => new Map(cats.data?.categories.map((c) => [c.id, c])), [cats.data]);
@@ -66,6 +72,23 @@ function Inner() {
       refresh();
     } catch (e) { toast((e as Error).message, true); } finally { setBusy(false); }
   };
+  const rejectOutside = async () => {
+    const n = sum.data?.scope.clear ?? 0;
+    if (!confirm(`Reject ${n.toLocaleString()} new entries that are clearly unrelated to Ryan's KB?\n\nThey are not deleted: they stay under Rejected, and you can reopen any of them. Borderline entries, and ones that changed or were removed on the website, are left for you to decide.`)) return;
+    setBusy(true);
+    try {
+      const r = await api<{ done: number }>(`/api/chatbots/${bot}/entries/reject-outside`, { body: {} });
+      toast(`${r.done.toLocaleString()} entries rejected`);
+      select(null);
+      refresh();
+    } catch (e) { toast((e as Error).message, true); } finally { setBusy(false); }
+  };
+  const setTopic = (id: string) => {
+    const p = new URLSearchParams(params.toString());
+    if (id) p.set("topic", id); else p.delete("topic");
+    p.delete("entry");
+    router.replace(`/${bot}/review?${p}`, { scroll: false });
+  };
   const st = sum.data?.status;
   const waiting = st ? st.new + st.changed + st.removal : 0;
   const allPicked = entries.length > 0 && entries.every((e) => picked.has(e.id));
@@ -90,6 +113,15 @@ function Inner() {
       <div className="flex min-h-0 flex-1">
         {/* categories */}
         <div className="scroll-thin w-[232px] shrink-0 overflow-y-auto border-r border-line p-3">
+          {scopeOn && queueView && sum.data && (
+            <>
+              <p className="px-2 pb-1.5 text-[11px] font-medium uppercase tracking-wider text-neutral-400">Ryan&apos;s KB</p>
+              <CatRow active={scopeView === "in"} onClick={() => { setScopeSel("in"); setTopic(""); }} name="Inside Ryan's KB" count={sum.data.scope.in} dot="bg-emerald-500" title="Entries that match a topic in the SME's own knowledge base" />
+              <CatRow active={scopeView === "out"} onClick={() => { setScopeSel("out"); setTopic(""); }} name="Outside Ryan's KB" count={sum.data.scope.out} dot="bg-amber-500" title="Entries that match nothing the SME maintains" />
+              <CatRow active={scopeView === ""} onClick={() => { setScopeSel(""); setTopic(""); }} name="Everything" count={waiting} dot="bg-neutral-300" />
+              <div className="h-4" />
+            </>
+          )}
           <p className="px-2 pb-1.5 text-[11px] font-medium uppercase tracking-wider text-neutral-400">Categories</p>
           <CatRow active={cat === ""} onClick={() => setCat("")} name="All categories" count={queueView ? waiting : st?.[view as EntryStatus] ?? 0} />
           {cats.data?.categories.map((c) => (
@@ -115,6 +147,18 @@ function Inner() {
               <Search className="absolute left-3 top-2.5 size-4 text-neutral-400" />
               <input className={cn(inputCls, "pl-9")} placeholder="Search entries" value={q} onChange={(e) => setQ(e.target.value)} />
             </div>
+            {topic && (
+              <div className="flex items-center gap-2 rounded-lg bg-neutral-100 px-2.5 py-1.5 text-xs">
+                <span className="min-w-0 flex-1 truncate">Ryan&apos;s KB topic: <b>{entries[0]?.scope?.topic ?? `#${topic}`}</b></span>
+                <button aria-label="Clear topic filter" onClick={() => setTopic("")} className="rounded p-0.5 text-neutral-500 hover:text-ink"><X className="size-3.5" /></button>
+              </div>
+            )}
+            {scopeOn && scopeView === "out" && queueView && (sum.data?.scope.out ?? 0) > 0 && !topic && (
+              <div className="rounded-lg border border-amber-200 bg-amber-50 px-2.5 py-2 text-xs text-amber-900">
+                These do not match Ryan&apos;s KB. {sum.data?.scope.clear.toLocaleString()} are clearly unrelated; the rest are borderline, so read those before deciding.
+                {!!sum.data?.scope.clear && <Button size="sm" busy={busy} onClick={rejectOutside} className="mt-1.5 h-7 w-full">Reject the {sum.data?.scope.clear.toLocaleString()} clearly unrelated</Button>}
+              </div>
+            )}
             <div className="flex h-7 items-center gap-2 text-xs text-muted">
               {queueView && <input type="checkbox" aria-label="Select all" className="size-3.5 accent-black" checked={allPicked} onChange={() => setPicked(allPicked ? new Set() : new Set(entries.map((e) => e.id)))} />}
               {picked.size ? (
@@ -147,6 +191,7 @@ function Inner() {
                     <CategoryChip cat={e.category_id ? catMap.get(e.category_id) : null} muted />
                     {e.secondary_ids.length > 0 && <span className="text-[11px] text-neutral-400">+{e.secondary_ids.length}</span>}
                     {e.duplicate_of && <Badge tone="violet" className="h-[18px] px-1.5 text-[10px]">Duplicate</Badge>}
+                    {e.scope && !e.scope.in && <Badge tone="amber" className="h-[18px] px-1.5 text-[10px]" >Outside</Badge>}
                     <span className="ml-auto shrink-0 text-[11px] text-neutral-400">{ago(e.detected_at)}</span>
                   </div>
                 </div>
@@ -166,10 +211,10 @@ function Inner() {
   );
 }
 
-function CatRow({ name, count, color, active, onClick, dashed, title }: { name: string; count: number; color?: string; active: boolean; onClick: () => void; dashed?: boolean; title?: string }) {
+function CatRow({ name, count, color, active, onClick, dashed, title, dot }: { name: string; count: number; color?: string; active: boolean; onClick: () => void; dashed?: boolean; title?: string; dot?: string }) {
   return (
     <button onClick={onClick} title={title} className={cn("mb-0.5 flex h-8 w-full items-center gap-2 rounded-lg px-2 text-left text-[13px]", active ? "bg-neutral-100 font-medium text-ink" : "text-neutral-600 hover:bg-subtle")}>
-      <span className={cn("size-2 shrink-0 rounded-full", color ? DOT[color] : dashed ? "border border-dashed border-neutral-400" : "bg-ink")} />
+      <span className={cn("size-2 shrink-0 rounded-full", dot ?? (color ? DOT[color] : dashed ? "border border-dashed border-neutral-400" : "bg-ink"))} />
       <span className="flex-1 truncate">{name}</span>
       <span className={cn("text-xs tabular-nums", count ? "text-neutral-500" : "text-neutral-300")}>{count}</span>
     </button>
@@ -228,6 +273,8 @@ function Detail({ id, cats, onDecided, onChanged, onOpen }: { id: string; cats: 
 
       {e.status === "removal" && <Note tone="red">This content is no longer on the website. <b>Approve removal</b> to take it out of the knowledge base, or <b>Keep it</b> if the chatbot should still know it.</Note>}
       {e.status === "changed" && <Note tone="amber">The website changed after this entry was approved. The approved text stays live until you approve the change.</Note>}
+      {e.scope && !e.scope.in && <Note tone="amber">This does not match anything in Ryan&apos;s KB{e.scope.topic ? <> (closest topic: “{e.scope.topic}”, {Math.round((e.scope.score ?? 0) * 100)}% alike)</> : null}, so the chatbot is not expected to know it. Reject it unless Ryan should be maintaining it.</Note>}
+      {e.scope?.in && <p className="mt-3 text-xs text-muted">Matches Ryan&apos;s KB topic <b className="font-medium text-ink">{e.scope.topic}</b> · {Math.round((e.scope.score ?? 0) * 100)}% alike</p>}
       {e.duplicate_of && <Note tone="violet"><Copy className="mr-1 inline size-3.5" />The same text also appears on another page. <button className="font-medium underline" onClick={() => onOpen(e.duplicate_of!)}>Open the other entry</button> and keep only one, so the chatbot is not given the same answer twice.</Note>}
 
       {editing ? (

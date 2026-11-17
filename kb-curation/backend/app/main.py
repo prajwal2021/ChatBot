@@ -6,19 +6,19 @@ import re
 from contextlib import asynccontextmanager
 from datetime import timedelta
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Response
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from . import categorize, docgen, gdocs, pipeline, publish, review
+from . import categorize, docgen, gdocs, pipeline, publish, review, scope
 from .config import DATA_DIR, OPENAI_API_KEY, WEB_ORIGIN
 from .crawler import canon
 from .db import Base, SessionLocal, engine, get_db
 from .diffing import line_diff
 from .pipeline import record
-from .models import Activity, Category, Chatbot, Comment, CrawlRun, Entry, EntryEvent, KbVersion, Page, PageEvent, Source, now
+from .models import Activity, Category, Chatbot, Comment, CrawlRun, Entry, EntryEvent, KbVersion, Page, PageEvent, ScopeTopic, Source, now
 
 QUEUE = ("new", "changed", "removal")
 
@@ -62,6 +62,11 @@ async def lifespan(_: FastAPI):
         con.exec_driver_sql("ALTER TABLE pages ADD COLUMN IF NOT EXISTS checks JSONB DEFAULT '[]'::jsonb")
         con.exec_driver_sql("ALTER TABLE pages ADD COLUMN IF NOT EXISTS verified_hash VARCHAR(64)")
         con.exec_driver_sql("ALTER TABLE pages ADD COLUMN IF NOT EXISTS keep BOOLEAN DEFAULT false")
+        con.exec_driver_sql("ALTER TABLE chatbots ADD COLUMN IF NOT EXISTS scope_threshold DOUBLE PRECISION")
+        con.exec_driver_sql("ALTER TABLE entries ADD COLUMN IF NOT EXISTS scope_topic_id INTEGER")
+        con.exec_driver_sql("ALTER TABLE entries ADD COLUMN IF NOT EXISTS scope_score DOUBLE PRECISION")
+        con.exec_driver_sql("ALTER TABLE entries ADD COLUMN IF NOT EXISTS in_scope BOOLEAN")
+        con.exec_driver_sql("ALTER TABLE entries ADD COLUMN IF NOT EXISTS scope_verdict BOOLEAN")
     seed()
     pipeline.start_background()
     yield
@@ -86,7 +91,7 @@ def get_bot(key: str, db: Session = Depends(get_db)) -> Chatbot:
 def guard(fn, *a, **kw):
     try:
         return fn(*a, **kw)
-    except (review.ReviewError, ValueError) as e:
+    except (review.ReviewError, scope.ScopeError, ValueError) as e:
         raise HTTPException(400, str(e))
 
 
@@ -109,9 +114,15 @@ def shown(e: Entry) -> dict:
             "secondary_ids": e.secondary_ids or [], "labels": e.labels or []}
 
 
-def entry_dict(e: Entry, page: Page | None, full: bool = False) -> dict:
+def topic_names(db: Session, bot_id: int) -> dict[int, str]:
+    return dict(db.execute(select(ScopeTopic.id, ScopeTopic.name).where(ScopeTopic.chatbot_id == bot_id)).all())
+
+
+def entry_dict(e: Entry, page: Page | None, full: bool = False, topics: dict[int, str] | None = None) -> dict:
     s = shown(e)
-    d = {"id": e.id, "status": e.status, **s, "page": {"id": page.id, "url": page.url, "title": page.title, "status": page.status} if page else None,
+    d = {"id": e.id, "status": e.status, **s,
+         "scope": None if e.in_scope is None else {"in": e.in_scope, "topic_id": e.scope_topic_id, "score": e.scope_score,
+                                                   "topic": (topics or {}).get(e.scope_topic_id)}, "page": {"id": page.id, "url": page.url, "title": page.title, "status": page.status} if page else None,
          "has_approved": e.content is not None, "duplicate_of": e.duplicate_of, "manual_edit": e.manual_edit, "edited": e.p_edited, "reviewer": e.reviewer,
          "reviewed_at": e.reviewed_at, "detected_at": e.detected_at, "updated_at": e.updated_at, "revision": e.revision}
     if not full:
@@ -385,7 +396,7 @@ def page_detail(pid: int, db: Session = Depends(get_db)):
     return {"id": p.id, "url": p.url, "title": p.title, "status": p.status, "reason": p.skip_reason, "http_status": p.http_status,
             "first_seen_at": p.first_seen_at, "last_crawled_at": p.last_crawled_at, "last_changed_at": p.last_changed_at,
             "change_count": p.change_count, "found_via": p.found_via, "verdict": p.verdict, "checks": p.checks or [], "kept_by_person": bool(p.keep), "events": [event_dict(e, p, diff=i == 0 or e.kind != "new") for i, e in enumerate(events)],
-            "entries": [entry_dict(e, None) for e in entries]}
+            "entries": [entry_dict(e, None, topics=topic_names(db, p.chatbot_id)) for e in entries]}
 
 
 @app.get("/api/chatbots/{key}/changes")
@@ -504,11 +515,18 @@ def recategorize(bot: Chatbot = Depends(get_bot), who: str = Depends(actor), db:
 
 @app.get("/api/chatbots/{key}/entries")
 def entries(status: str = "queue", category: str | None = None, q: str | None = None, label: str | None = None,
-            page_id: int | None = None, limit: int = 300, bot: Chatbot = Depends(get_bot), db: Session = Depends(get_db)):
+            page_id: int | None = None, scope_filter: str | None = Query(default=None, alias="scope"), topic: int | None = None, limit: int = 300, bot: Chatbot = Depends(get_bot), db: Session = Depends(get_db)):
     statuses = QUEUE if status == "queue" else tuple(status.split(","))
     query = select(Entry, Page).outerjoin(Page, Page.id == Entry.page_id).where(Entry.chatbot_id == bot.id, Entry.status.in_(statuses))
     if page_id:
         query = query.where(Entry.page_id == page_id)
+    if scope_filter == "in":
+        query = query.where(Entry.in_scope.is_(True))
+    elif scope_filter == "out":
+        query = query.where(Entry.in_scope.is_(False))
+    if topic:
+        query = query.where(Entry.scope_topic_id == topic, Entry.in_scope.is_(True))
+    names = topic_names(db, bot.id)
     out, total = [], 0
     ql = (q or "").lower().strip()
     for e, p in db.execute(query.order_by(Page.url, Entry.position)):
@@ -524,7 +542,7 @@ def entries(status: str = "queue", category: str | None = None, q: str | None = 
             continue
         total += 1
         if len(out) < limit:
-            out.append(entry_dict(e, p))
+            out.append(entry_dict(e, p, topics=names))
     return {"total": total, "entries": out}
 
 
@@ -535,8 +553,14 @@ def review_summary(bot: Chatbot = Depends(get_bot), db: Session = Depends(get_db
     for e in db.scalars(select(Entry).where(Entry.chatbot_id == bot.id, Entry.status.in_(QUEUE + ("approved",)))):
         for l in shown(e)["labels"]:
             labels[l] = labels.get(l, 0) + 1
+    sc = dict(db.execute(select(Entry.in_scope, func.count()).where(Entry.chatbot_id == bot.id, Entry.status.in_(QUEUE)).group_by(Entry.in_scope)).all())
+    has_scope = bool(db.scalar(select(func.count()).select_from(ScopeTopic).where(ScopeTopic.chatbot_id == bot.id)))
     return {"status": {s: st.get(s, 0) for s in ("new", "changed", "removal", "approved", "rejected", "removed")},
-            "labels": sorted(labels.items(), key=lambda x: -x[1])}
+            "labels": sorted(labels.items(), key=lambda x: -x[1]),
+            "scope": {"enabled": has_scope, "in": sc.get(True, 0), "out": sc.get(False, 0), "unchecked": sc.get(None, 0),
+                      "clear": db.scalar(select(func.count()).select_from(Entry).where(
+                          Entry.chatbot_id == bot.id, Entry.status == "new", Entry.in_scope.is_(False),
+                          Entry.scope_score < (bot.scope_threshold or scope.DEFAULT_THRESHOLD) - scope.CLEAR_MARGIN)) or 0}}
 
 
 def _entry(db: Session, eid: int) -> Entry:
@@ -548,7 +572,7 @@ def _entry(db: Session, eid: int) -> Entry:
 
 def _detail(db: Session, e: Entry) -> dict:
     p = db.get(Page, e.page_id) if e.page_id else None
-    d = entry_dict(e, p, full=True)
+    d = entry_dict(e, p, full=True, topics=topic_names(db, e.chatbot_id))
     d["approved"] = {"title": e.title, "content": e.content, "category_id": e.category_id,
                      "secondary_ids": e.secondary_ids or [], "labels": e.labels or []} if e.content is not None else None
     if e.status == "changed":
@@ -635,6 +659,80 @@ def bulk(b: BulkIn, bot: Chatbot = Depends(get_bot), who: str = Depends(actor), 
         record(db, bot.id, "review", "bulk_" + b.action, who, f"{'Approved' if b.action == 'approve' else 'Rejected'} {done} entries in one go", skipped=len(skipped))
     db.commit()
     return {"done": done, "skipped": skipped}
+
+
+@app.post("/api/chatbots/{key}/entries/reject-outside")
+def reject_outside(bot: Chatbot = Depends(get_bot), who: str = Depends(actor), db: Session = Depends(get_db)):
+    """Reject every NEW entry that is clearly unrelated to the SME's KB. Borderline ones, changes and removals are left for a person."""
+    n = 0
+    cut = (bot.scope_threshold or scope.DEFAULT_THRESHOLD) - scope.CLEAR_MARGIN
+    for e in db.scalars(select(Entry).where(Entry.chatbot_id == bot.id, Entry.status == "new", Entry.in_scope.is_(False), Entry.scope_score < cut)):
+        review.reject(db, e, who, "Clearly unrelated to the SME's knowledge base")
+        n += 1
+    if n:
+        record(db, bot.id, "review", "bulk_reject", who, f"Rejected {n} entries that are clearly unrelated to the SME's KB", count=n)
+    db.commit()
+    return {"done": n}
+
+
+# ── the SME's own KB (scope) ──────────────────────────────────────────────────
+
+def scope_dict(bot: Chatbot, db: Session) -> dict:
+    topics = db.scalars(select(ScopeTopic).where(ScopeTopic.chatbot_id == bot.id).order_by(ScopeTopic.position)).all()
+    stat: dict[int, dict] = {t.id: {"matched": 0, "waiting": 0, "approved": 0} for t in topics}
+    outside = {"waiting": 0, "approved": 0}
+    for tid, st, ins, n in db.execute(select(Entry.scope_topic_id, Entry.status, Entry.in_scope, func.count())
+                                      .where(Entry.chatbot_id == bot.id, Entry.status.in_(QUEUE + ("approved",)))
+                                      .group_by(Entry.scope_topic_id, Entry.status, Entry.in_scope)):
+        if ins is False:
+            outside["approved" if st == "approved" else "waiting"] += n
+        elif ins and tid in stat:
+            stat[tid]["matched"] += n
+            stat[tid]["approved" if st == "approved" else "waiting"] += n
+    return {"enabled": bool(topics), "threshold": bot.scope_threshold or scope.DEFAULT_THRESHOLD, "default_threshold": scope.DEFAULT_THRESHOLD,
+            "ai": bool(OPENAI_API_KEY), "outside": outside,
+            "topics": [{"id": t.id, "name": t.name, "group": t.group, "words": t.words, **stat[t.id]} for t in topics]}
+
+
+@app.get("/api/chatbots/{key}/scope")
+def get_scope(bot: Chatbot = Depends(get_bot), db: Session = Depends(get_db)):
+    return scope_dict(bot, db)
+
+
+@app.get("/api/scope-topics/{tid}")
+def scope_topic(tid: int, db: Session = Depends(get_db)):
+    t = db.get(ScopeTopic, tid)
+    if not t:
+        raise HTTPException(404)
+    return {"id": t.id, "name": t.name, "group": t.group, "words": t.words, "text": t.text[:20000], "truncated": len(t.text) > 20000}
+
+
+class ScopeIn(BaseModel):
+    threshold: float | None = None
+    text: str | None = None
+
+
+@app.put("/api/chatbots/{key}/scope")
+def set_scope(b: ScopeIn, bot: Chatbot = Depends(get_bot), who: str = Depends(actor), db: Session = Depends(get_db)):
+    if b.threshold is not None:
+        if not 0.3 <= b.threshold <= 0.9:
+            raise HTTPException(400, "Choose a value between 0.30 and 0.90.")
+        bot.scope_threshold = round(b.threshold, 2)
+        scope.apply_threshold(db, bot)
+        record(db, bot.id, "settings", "scope_threshold", who, f"Set how closely entries must match the SME's KB to {bot.scope_threshold:.2f}")
+    if b.text is not None:
+        r = guard(scope.import_topics, db, bot, b.text)
+        record(db, bot.id, "settings", "scope_import", who, f"Loaded the SME's KB: {r['topics']} topics")
+    db.commit()
+    return scope_dict(bot, db)
+
+
+@app.post("/api/chatbots/{key}/scope/match")
+def rematch(bot: Chatbot = Depends(get_bot), who: str = Depends(actor), db: Session = Depends(get_db)):
+    r = guard(scope.match, bot.id)
+    record(db, bot.id, "settings", "scope_match", who, f"Compared entries with the SME's KB: {r['in_scope']} inside, {r['outside']} outside")
+    db.commit()
+    return scope_dict(bot, db)
 
 
 # ── publishing, versions, document ────────────────────────────────────────────

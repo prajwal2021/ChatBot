@@ -48,7 +48,7 @@ def propose_removal(db: Session, e: Entry, why: str) -> bool:
     if e.status in ("removed", "removal") or e.content is None or e.rejected_hash == KEEP:
         return False                      # KEEP: a reviewer chose to keep this although the website dropped it
     clear_proposal(e)
-    e.status, e.detected_at, e.source_hash = "removal", now(), None
+    e.status, e.detected_at = "removal", now()
     log(db, e, "removal_detected", reason=why)
     return True
 
@@ -100,7 +100,10 @@ def sync_entries(db: Session, bot: Chatbot, page: Page, sections: list[dict], ca
             stats["new"] += 1
             continue
         e.position = pos
-        if e.source_hash == s["hash"]:
+        if e.source_hash == s["hash"] and e.status != "removed":
+            if e.status == "removal":     # it was going to be removed, but the page is back unchanged
+                e.status = "approved"
+                log(db, e, "back_on_site", page=page.url)
             continue                      # this section did not change on the website
         e.source_hash = s["hash"]
         if s["hash"] == e.rejected_hash:
@@ -206,7 +209,8 @@ def apply_result(db: Session, bot: Chatbot, src: Source, run: CrawlRun, f: Fetch
         was_active = page.status == "active" and page.content_hash
         page.status, page.skip_reason = "skipped", "Did not pass verification: " + (verify.failed_reason(page.checks or []) or "see checks")
         page.content_hash, page.text = None, None
-        stats["rejected"] += 1
+        if f.checks is not None:
+            stats["rejected"] += 1         # only pages that failed in this run, not ones that failed before
         for e in db.scalars(select(Entry).where(Entry.page_id == page.id)) if not is_new else []:
             if propose_removal(db, e, page.skip_reason) and was_active:
                 stats["entries_removal"] += 1
@@ -357,9 +361,16 @@ def execute(run_id: int) -> None:
             run.stage, run.progress = "categorising", {}
             db.commit()
             recategorize(bot.id, since=run.started_at)
+        if stats["entries_new"] or stats["entries_changed"]:
+            try:                                                  # compare new entries with the SME's own KB, if one is loaded
+                from . import scope
+                scope.match(bot.id, only_new=True)
+            except Exception:                                     # noqa: BLE001
+                pass
         stats["pages"] = len(list(db.scalars(select(Page.id).where(Page.chatbot_id == bot.id, Page.status == "active"))))
         run.stats, run.status, run.stage, run.finished_at, run.progress = stats, "done", "done", now(), {}
-        bits = [f"{stats[k]} {label}" for k, label in (("new", "new pages"), ("changed", "updated"), ("removed", "removed"), ("rejected", "failed verification")) if stats[k]]
+        bits = [f"{stats[k]} {label if stats[k] != 1 else label.replace('pages', 'page')}" for k, label in
+                (("new", "new pages"), ("changed", "updated"), ("removed", "removed"), ("rejected", "failed verification")) if stats[k]]
         record(db, bot.id, "pages", "crawl", run.created_by if run.trigger == "manual" else "Schedule",
                "Checked the websites: " + (", ".join(bits) if bits else "no changes") + f" ({stats['pages']} pages tracked)", run_id=run.id, **stats)
         db.commit()

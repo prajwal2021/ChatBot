@@ -77,6 +77,7 @@ export type Entry = {
   id: number; status: EntryStatus; title: string; excerpt?: string; content?: string; category_id: number | null; secondary_ids: number[]; labels: string[];
   page: PageRef | null; has_approved: boolean; duplicate_of: number | null; manual_edit: boolean; edited: boolean; reviewer: string | null;
   reviewed_at: string | null; detected_at: string; updated_at: string; revision: number;
+  scope: { in: boolean; topic_id: number | null; score: number | null; topic: string | null } | null;
 };
 export type EntryDetail = Entry & {
   content: string; approved: { title: string; content: string; category_id: number | null; secondary_ids: number[]; labels: string[] } | null;

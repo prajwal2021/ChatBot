@@ -40,3 +40,20 @@ The chatbot should index the JSON feed (`GET /api/chatbots/{key}/export?format=j
 category, labels and source URL. Wiring that into `vectors/` is the next phase.
 
 There is no login yet: the reviewer name is typed in the sidebar and recorded with each action.
+
+
+## Ryan's KB (the SME's own knowledge base as a scope)
+
+Load the document the SME maintains, and every entry found on the website is compared with its topics:
+
+```bash
+cd backend
+.venv/bin/python -m app.scope_import k12 /path/to/K12.pdf        # needs pdftotext (brew install poppler) and OPENAI_API_KEY
+.venv/bin/python -m app.scope_import ttu-online /path/to/online.pdf
+```
+
+Entries close to a topic are "inside Ryan's KB" (shown by default in Review); the rest are "outside". The **Ryan's KB**
+screen lists his topics and whether the website covers them, and has a slider for how strict the match is. New entries
+found by later crawls are compared automatically. Nothing is rejected without a person pressing the button.
+
+Borderline entries (similarity between 0.45 and 0.72) are read by an AI model that decides whether they are the kind of fact the topics cover; staff profiles, meeting minutes, address footers and bare link lists are turned down. The slider only decides the rest.

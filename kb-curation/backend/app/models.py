@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -31,6 +31,7 @@ class Chatbot(Base):
     gdoc_synced_version: Mapped[int | None] = mapped_column(Integer)
     gdoc_synced_at: Mapped[datetime | None] = mapped_column(TS)
     gdoc_error: Mapped[str | None] = mapped_column(Text)
+    scope_threshold: Mapped[float | None] = mapped_column(Float)     # how close to Ryan's KB an entry must be
     created_at: Mapped[datetime] = mapped_column(TS, default=now)
 
 
@@ -153,6 +154,10 @@ class Entry(Base):
     rejected_hash: Mapped[str | None] = mapped_column(String(64))    # a rejected proposal is not proposed again
     duplicate_of: Mapped[int | None] = mapped_column(Integer)        # entry on another page with identical text
     manual_edit: Mapped[bool] = mapped_column(Boolean, default=False)  # approved text differs from the website
+    scope_topic_id: Mapped[int | None] = mapped_column(Integer)       # closest topic in the SME's own KB
+    scope_score: Mapped[float | None] = mapped_column(Float)          # 0-1 similarity to that topic
+    in_scope: Mapped[bool | None] = mapped_column(Boolean)            # None = not checked yet
+    scope_verdict: Mapped[bool | None] = mapped_column(Boolean)       # an AI reading of a borderline entry (None = score decided)
     reviewer: Mapped[str | None] = mapped_column(String(80))
     reviewed_at: Mapped[datetime | None] = mapped_column(TS)
     revision: Mapped[int] = mapped_column(Integer, default=0)
@@ -208,3 +213,24 @@ class Activity(Base):
     summary: Mapped[str] = mapped_column(Text)
     detail: Mapped[dict] = mapped_column(JSONB, default=dict)
     created_at: Mapped[datetime] = mapped_column(TS, default=now, index=True)
+
+
+class ScopeTopic(Base):
+    """One topic of the knowledge base the SME maintains by hand ("If asked about X, answer with ...")."""
+    __tablename__ = "scope_topics"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    chatbot_id: Mapped[int] = mapped_column(ForeignKey("chatbots.id", ondelete="CASCADE"), index=True)
+    name: Mapped[str] = mapped_column(Text)
+    group: Mapped[str] = mapped_column(String(60), default="General")
+    position: Mapped[int] = mapped_column(Integer, default=0)
+    words: Mapped[int] = mapped_column(Integer, default=0)
+    text: Mapped[str] = mapped_column(Text, default="")
+
+
+class ScopeChunk(Base):
+    __tablename__ = "scope_chunks"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    chatbot_id: Mapped[int] = mapped_column(Integer, index=True)
+    topic_id: Mapped[int] = mapped_column(ForeignKey("scope_topics.id", ondelete="CASCADE"), index=True)
+    text: Mapped[str] = mapped_column(Text)
+    emb: Mapped[list] = mapped_column(JSONB)

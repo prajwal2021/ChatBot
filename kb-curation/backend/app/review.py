@@ -9,6 +9,9 @@ from .models import Category, Entry, now
 from .pipeline import KEEP, clear_proposal, log
 
 
+SYSTEM_LABELS = ("Duplicate", "Not linked on site", "Long entry")
+
+
 class ReviewError(Exception):
     pass
 
@@ -69,7 +72,8 @@ def approve(db: Session, e: Entry, actor: str) -> None:
         raise ReviewError("Choose a category before approving.")
     kind = "change_approved" if e.content is not None else "approved"
     e.title, e.content, e.category_id = e.p_title, e.p_content, e.p_category_id
-    e.secondary_ids, e.labels = list(e.p_secondary_ids or []), list(e.p_labels or [])
+    e.secondary_ids = list(e.p_secondary_ids or [])
+    e.labels = [x for x in e.p_labels or [] if x not in SYSTEM_LABELS]      # review flags are not knowledge
     e.manual_edit, e.revision = bool(e.p_edited), e.revision + 1
     e.status, e.reviewer, e.reviewed_at, e.rejected_hash = "approved", actor, now(), None
     clear_proposal(e)

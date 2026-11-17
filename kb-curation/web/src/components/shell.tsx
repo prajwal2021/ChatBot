@@ -1,5 +1,5 @@
 "use client";
-import { BookOpenCheck, Check, ChevronsUpDown, FileText, GitCompareArrows, Globe, History, LayoutDashboard, ListChecks, Plus, Rocket, Settings, UserRound, Files } from "lucide-react";
+import { BookOpenCheck, Check, ChevronsUpDown, FileText, GitCompareArrows, Globe, History, LayoutDashboard, ListChecks, Plus, Target, Rocket, Settings, UserRound, Files } from "lucide-react";
 import Link from "next/link";
 import { useParams, usePathname, useRouter } from "next/navigation";
 import { useEffect, useRef, useState, type ReactNode } from "react";
@@ -17,6 +17,7 @@ const NAV: { group?: string; items: { href: string; label: string; icon: typeof 
     { href: "/changes", label: "Changes", icon: GitCompareArrows },
   ] },
   { group: "Curate", items: [
+    { href: "/scope", label: "Ryan's KB", icon: Target },
     { href: "/review", label: "Review", icon: ListChecks, badge: true },
     { href: "/publish", label: "Publish", icon: Rocket },
   ] },
