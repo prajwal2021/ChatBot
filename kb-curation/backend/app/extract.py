@@ -12,7 +12,7 @@ from urllib.parse import urljoin
 from bs4 import BeautifulSoup, Comment, NavigableString, Tag
 
 DROP_TAGS = ["script", "style", "noscript", "nav", "header", "footer", "form", "iframe", "svg", "button", "select", "template"]
-DROP_CLASS = re.compile(r"breadcrumb|swiper|carousel|slider|social|skip-|cookie|sr-only|visually-hidden|modal|pagination", re.I)
+DROP_CLASS = re.compile(r"footer-copyright|breadcrumb|swiper|carousel|slider|social|skip-|cookie|sr-only|visually-hidden|modal|pagination", re.I)
 HEADINGS = {"h1": 1, "h2": 2, "h3": 3, "h4": 4}
 BLOCKS = {"p", "div", "section", "article", "ul", "ol", "table", "h1", "h2", "h3", "h4", "h5", "h6", "blockquote",
           "dl", "dt", "dd", "figure", "figcaption", "details", "summary", "main", "address", "pre", "hr", "li", "tr"}
@@ -151,24 +151,10 @@ def page_links(soup: BeautifulSoup, base: str) -> list[str]:
             if not a["href"].strip().lower().startswith(("#", "mailto:", "tel:", "javascript"))]
 
 
-def extract(html: str, url: str) -> dict:
-    soup = BeautifulSoup(html, "lxml")
-    links = page_links(soup, url)
-    raw_title = norm(soup.title.get_text()) if soup.title else ""
-    main = soup.find("main") or soup.find(id=re.compile(r"main.?content|^content$", re.I)) or soup.body or soup
-    for t in main.find_all(DROP_TAGS):
-        t.decompose()
-    for t in main.find_all(class_=DROP_CLASS):
-        if not t.decomposed:
-            t.decompose()
-    h1 = main.find("h1")
-    title = norm(h1.get_text(" ")) if h1 and norm(h1.get_text(" ")) else re.split(r"\s+[|–—]\s+", raw_title)[0]
-    title = title or url
-    b = _Builder(url, title)
-    b.walk(main)
-
+def _clean(raw: list[dict]) -> list[dict]:
+    """Drop noise lines and headings with nothing under them; give each section a unique key and a hash."""
     sections, seen = [], {}
-    for s in b.sections:
+    for s in raw:
         lines = [x for x in s["lines"] if not NOISE.match(x)]
         body = "\n".join(lines)
         if len(re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", body)) < 25:      # heading with nothing under it
@@ -178,5 +164,39 @@ def extract(html: str, url: str) -> dict:
         if seen[k] > 1:
             k = f"{k}-{seen[k]}"
         sections.append({"key": k, "title": s["title"], "level": s["level"], "content": body, "hash": sha(s["title"], body)})
-    text = "\n\n".join(f"## {s['title']}\n{s['content']}" for s in sections)
-    return {"title": title, "sections": sections, "links": links, "text": text, "hash": sha(text)}
+    return sections
+
+
+def page_text(sections: list[dict]) -> str:
+    return "\n\n".join(f"## {s['title']}\n{s['content']}" for s in sections)
+
+
+def extract(html: str, url: str) -> dict:
+    """The site-wide contact block (.l-contact) repeats on most pages, so it is returned apart as "contact"
+    (not in sections/text); crawler.attach_contacts() gives each distinct block to one page only."""
+    soup = BeautifulSoup(html, "lxml")
+    links = page_links(soup, url)
+    raw_title = norm(soup.title.get_text()) if soup.title else ""
+    main = soup.find("main") or soup.find(id=re.compile(r"main.?content|^content$", re.I)) or soup.body or soup
+    for t in main.find_all(DROP_TAGS):
+        t.decompose()
+    for t in main.find_all(class_=DROP_CLASS):
+        if not t.decomposed:
+            t.decompose()
+    contact = None
+    block = main.find(class_="l-contact")
+    if block:
+        block.extract()                    # taken out before the page title is picked: it can hold an <h1>
+        for h in block.find_all(list(HEADINGS)):
+            h.name = "p"                   # the block's own title must not split it into sections
+        cb = _Builder(url, "Contact information")
+        cb.walk(block)
+        contact = next(({**s, "key": "site-contact-block"} for s in _clean(cb.sections)), None)
+    h1 = main.find("h1")
+    title = norm(h1.get_text(" ")) if h1 and norm(h1.get_text(" ")) else re.split(r"\s+[|–—]\s+", raw_title)[0]
+    title = title or url
+    b = _Builder(url, title)
+    b.walk(main)
+    sections = _clean(b.sections)
+    text = page_text(sections)
+    return {"title": title, "sections": sections, "links": links, "text": text, "hash": sha(text), "contact": contact}
