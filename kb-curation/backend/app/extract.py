@@ -151,6 +151,18 @@ def page_links(soup: BeautifulSoup, base: str) -> list[str]:
             if not a["href"].strip().lower().startswith(("#", "mailto:", "tel:", "javascript"))]
 
 
+def _fold(raw: list[dict]) -> list[dict]:
+    """A section whose text ends with ':' introduces what follows: its sub-headings join it instead of
+    becoming entries of their own, until the next heading at its level or above."""
+    out: list[dict] = []
+    for s in raw:
+        if out and out[-1]["intro"] and s["level"] > out[-1]["level"]:
+            out[-1]["lines"] += [s["title"], *s["lines"]]
+        else:
+            out.append({**s, "intro": bool(s["lines"]) and s["lines"][-1].endswith(":")})
+    return out
+
+
 def _clean(raw: list[dict]) -> list[dict]:
     """Drop noise lines and headings with nothing under them; give each section a unique key and a hash."""
     sections, seen = [], {}
@@ -197,6 +209,6 @@ def extract(html: str, url: str) -> dict:
     title = title or url
     b = _Builder(url, title)
     b.walk(main)
-    sections = _clean(b.sections)
+    sections = _clean(_fold(b.sections))
     text = page_text(sections)
     return {"title": title, "sections": sections, "links": links, "text": text, "hash": sha(text), "contact": contact}
