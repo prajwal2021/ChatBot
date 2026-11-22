@@ -1,5 +1,5 @@
 "use client";
-import { AlertTriangle, ArrowRight, FolderTree, GitCompareArrows, Library, ListChecks, Rocket, Sparkles } from "lucide-react";
+import { AlertTriangle, ArrowRight, FolderTree, GitCompareArrows, Library, ListChecks, Rocket } from "lucide-react";
 import Link from "next/link";
 import { useApi } from "@/lib/api";
 import type { SnOverview } from "@/lib/sn";
@@ -65,10 +65,12 @@ export default function SnOverviewPage() {
                   <div key={s} className="flex justify-between"><span className="capitalize text-muted">{s === "removal" ? "Removal proposed" : s}</span><b className={cn("tabular-nums", !o.articles[s] && "font-normal text-neutral-300")}>{o.articles[s]}</b></div>
                 ))}
               </div>
-              <div className={cn("mt-4 flex gap-2 rounded-xl px-3 py-2.5 text-xs", o.ai ? "bg-violet-50 text-violet-900" : "bg-amber-50 text-amber-900")}>
-                {o.ai ? <Sparkles className="mt-px size-3.5 shrink-0" /> : <AlertTriangle className="mt-px size-3.5 shrink-0" />}
-                <span>{o.ai ? `Page changes are read by ${o.model}.` : "AI is off: linked pages are still checked, but no edits are proposed."}</span>
-              </div>
+              {!o.ai && (
+                <div className="mt-4 flex gap-2 rounded-xl bg-amber-50 px-3 py-2.5 text-xs text-amber-900">
+                  <AlertTriangle className="mt-px size-3.5 shrink-0" />
+                  <span>AI is off: linked pages are still checked, but no edits are proposed.</span>
+                </div>
+              )}
               <Link href={`/${bot}/servicenow/review`}><Button variant="primary" className="mt-4 w-full">Review articles <ArrowRight className="size-4" /></Button></Link>
             </Card>
           </div>
