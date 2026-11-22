@@ -234,3 +234,129 @@ class ScopeChunk(Base):
     topic_id: Mapped[int] = mapped_column(ForeignKey("scope_topics.id", ondelete="CASCADE"), index=True)
     text: Mapped[str] = mapped_column(Text)
     emb: Mapped[list] = mapped_column(JSONB)
+
+
+# ── ServiceNow curation ───────────────────────────────────────────────────────
+# A one-time import of ServiceNow knowledge articles, kept up to date from web pages ("links") that a person
+# attaches to a category. Separate from the website crawl above: its own review queue and published versions.
+
+class SnCategory(Base):
+    __tablename__ = "sn_categories"
+    __table_args__ = (UniqueConstraint("chatbot_id", "sys_id"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    chatbot_id: Mapped[int] = mapped_column(ForeignKey("chatbots.id", ondelete="CASCADE"), index=True)
+    sys_id: Mapped[str] = mapped_column(String(32))
+    parent_id: Mapped[int | None] = mapped_column(ForeignKey("sn_categories.id", ondelete="SET NULL"))
+    name: Mapped[str] = mapped_column(Text)
+    path: Mapped[str] = mapped_column(Text)                          # "Parent > Child > Name"
+    position: Mapped[int] = mapped_column(Integer, default=0)
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+
+
+class SnArticle(Base):
+    """One knowledge article. Statuses and proposal fields work like Entry: approved text vs p_* proposal."""
+    __tablename__ = "sn_articles"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    chatbot_id: Mapped[int] = mapped_column(ForeignKey("chatbots.id", ondelete="CASCADE"), index=True)
+    category_id: Mapped[int | None] = mapped_column(ForeignKey("sn_categories.id", ondelete="SET NULL"), index=True)
+    sys_id: Mapped[str | None] = mapped_column(String(32), index=True)     # None = proposed by the AI from a link
+    number: Mapped[str | None] = mapped_column(String(40))
+    sn_state: Mapped[str | None] = mapped_column(String(30))         # workflow state in ServiceNow at import
+    sn_template: Mapped[str | None] = mapped_column(String(60))
+    valid_to: Mapped[str | None] = mapped_column(String(20))
+    sn_updated: Mapped[str | None] = mapped_column(String(30))
+    source_html: Mapped[str | None] = mapped_column(Text)            # the article as imported, for reference
+    sn_content: Mapped[str | None] = mapped_column(Text)             # the imported text, before anyone changed it
+    status: Mapped[str] = mapped_column(String(10), default="new", index=True)   # new|changed|removal|approved|rejected|removed
+    title: Mapped[str | None] = mapped_column(Text)                  # approved
+    content: Mapped[str | None] = mapped_column(Text)
+    labels: Mapped[list] = mapped_column(JSONB, default=list)
+    p_title: Mapped[str | None] = mapped_column(Text)                # proposal waiting for review
+    p_content: Mapped[str | None] = mapped_column(Text)
+    p_category_id: Mapped[int | None] = mapped_column(Integer)
+    p_labels: Mapped[list] = mapped_column(JSONB, default=list)
+    p_kind: Mapped[str | None] = mapped_column(String(10))           # import | update | new | remove
+    p_reason: Mapped[str | None] = mapped_column(Text)               # why the AI proposed it
+    p_link_id: Mapped[int | None] = mapped_column(Integer)
+    p_event_id: Mapped[int | None] = mapped_column(Integer)
+    p_edited: Mapped[bool] = mapped_column(Boolean, default=False)
+    reviewer: Mapped[str | None] = mapped_column(String(80))
+    reviewed_at: Mapped[datetime | None] = mapped_column(TS)
+    revision: Mapped[int] = mapped_column(Integer, default=0)
+    detected_at: Mapped[datetime] = mapped_column(TS, default=now)
+    created_at: Mapped[datetime] = mapped_column(TS, default=now)
+    updated_at: Mapped[datetime] = mapped_column(TS, default=now, onupdate=now)
+
+
+class SnArticleEvent(Base):
+    __tablename__ = "sn_article_events"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    article_id: Mapped[int] = mapped_column(ForeignKey("sn_articles.id", ondelete="CASCADE"), index=True)
+    action: Mapped[str] = mapped_column(String(24))
+    actor: Mapped[str] = mapped_column(String(80), default="system")
+    detail: Mapped[dict] = mapped_column(JSONB, default=dict)
+    created_at: Mapped[datetime] = mapped_column(TS, default=now)
+
+
+class SnLink(Base):
+    """A web page that the articles of one category (or one pinned article) are kept in line with."""
+    __tablename__ = "sn_links"
+    __table_args__ = (UniqueConstraint("category_id", "url"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    chatbot_id: Mapped[int] = mapped_column(ForeignKey("chatbots.id", ondelete="CASCADE"), index=True)
+    category_id: Mapped[int] = mapped_column(ForeignKey("sn_categories.id", ondelete="CASCADE"), index=True)
+    article_id: Mapped[int | None] = mapped_column(ForeignKey("sn_articles.id", ondelete="SET NULL"))
+    url: Mapped[str] = mapped_column(Text)
+    label: Mapped[str] = mapped_column(String(120), default="")
+    schedule_hours: Mapped[int | None] = mapped_column(Integer, default=24)
+    next_run_at: Mapped[datetime | None] = mapped_column(TS)
+    last_checked_at: Mapped[datetime | None] = mapped_column(TS)
+    last_changed_at: Mapped[datetime | None] = mapped_column(TS)
+    status: Mapped[str] = mapped_column(String(12), default="pending")   # pending|ok|error|checking
+    error: Mapped[str | None] = mapped_column(Text)
+    title: Mapped[str | None] = mapped_column(Text)
+    content_hash: Mapped[str | None] = mapped_column(String(64))
+    text: Mapped[str | None] = mapped_column(Text)                   # page text at the last check
+    created_by: Mapped[str] = mapped_column(String(80), default="system")
+    created_at: Mapped[datetime] = mapped_column(TS, default=now)
+
+
+class SnLinkEvent(Base):
+    """One check of a link that found something: the page diff and what the AI decided to do about it."""
+    __tablename__ = "sn_link_events"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    chatbot_id: Mapped[int] = mapped_column(Integer, index=True)
+    link_id: Mapped[int] = mapped_column(ForeignKey("sn_links.id", ondelete="CASCADE"), index=True)
+    kind: Mapped[str] = mapped_column(String(10))                    # baseline | changed | audit | error
+    trigger: Mapped[str] = mapped_column(String(12), default="manual")
+    actor: Mapped[str] = mapped_column(String(80), default="system")
+    added: Mapped[int] = mapped_column(Integer, default=0)
+    removed: Mapped[int] = mapped_column(Integer, default=0)
+    diff: Mapped[list] = mapped_column(JSONB, default=list)
+    decisions: Mapped[list] = mapped_column(JSONB, default=list)     # [{action, article_id, title, reason}]
+    summary: Mapped[str] = mapped_column(Text, default="")
+    error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(TS, default=now, index=True)
+
+
+class SnVersion(Base):
+    __tablename__ = "sn_versions"
+    __table_args__ = (UniqueConstraint("chatbot_id", "number"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    chatbot_id: Mapped[int] = mapped_column(ForeignKey("chatbots.id", ondelete="CASCADE"), index=True)
+    number: Mapped[int] = mapped_column(Integer)
+    note: Mapped[str] = mapped_column(Text, default="")
+    created_by: Mapped[str] = mapped_column(String(80), default="unknown")
+    stats: Mapped[dict] = mapped_column(JSONB, default=dict)
+    items: Mapped[list] = mapped_column(JSONB, default=list)
+    changes: Mapped[list] = mapped_column(JSONB, default=list)
+    created_at: Mapped[datetime] = mapped_column(TS, default=now)
+
+
+class SnAsset(Base):
+    """An image copied from a ServiceNow attachment; the file lives under DATA_DIR/servicenow/assets."""
+    __tablename__ = "sn_assets"
+    sys_id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    content_type: Mapped[str] = mapped_column(String(80))
+    size: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(TS, default=now)

@@ -12,13 +12,13 @@ from pydantic import BaseModel
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from . import categorize, docgen, gdocs, pipeline, publish, review, scope
-from .config import DATA_DIR, OPENAI_API_KEY, WEB_ORIGIN
+from . import categorize, docgen, gdocs, pipeline, publish, review, scope, servicenow, sn_api
+from .config import DATA_DIR, EXTRA_ORIGINS, OPENAI_API_KEY, WEB_ORIGIN
 from .crawler import canon
 from .db import Base, SessionLocal, engine, get_db
 from .diffing import line_diff
 from .pipeline import record
-from .models import Activity, Category, Chatbot, Comment, CrawlRun, Entry, EntryEvent, KbVersion, Page, PageEvent, ScopeTopic, Source, now
+from .models import Activity, Category, Chatbot, Comment, CrawlRun, Entry, EntryEvent, KbVersion, Page, PageEvent, ScopeTopic, SnArticle, Source, now
 
 QUEUE = ("new", "changed", "removal")
 
@@ -69,12 +69,16 @@ async def lifespan(_: FastAPI):
         con.exec_driver_sql("ALTER TABLE entries ADD COLUMN IF NOT EXISTS scope_verdict BOOLEAN")
     seed()
     pipeline.start_background()
+    servicenow.start_background()
     yield
 
 
 app = FastAPI(title="KB Curation", lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=[WEB_ORIGIN, "http://localhost:3010", "http://127.0.0.1:3010"],
+app.add_middleware(CORSMiddleware, allow_origins=[WEB_ORIGIN, "http://localhost:3010", "http://127.0.0.1:3010", *EXTRA_ORIGINS],
                    allow_methods=["*"], allow_headers=["*"], expose_headers=["Content-Disposition"])
+
+
+app.include_router(sn_api.router)
 
 
 def actor(x_reviewer: str | None = Header(default=None)) -> str:
@@ -151,7 +155,8 @@ def chatbots(db: Session = Depends(get_db)):
     out = []
     for b in db.scalars(select(Chatbot).order_by(Chatbot.id)):
         waiting = db.scalar(select(func.count()).select_from(Entry).where(Entry.chatbot_id == b.id, Entry.status.in_(QUEUE)))
-        out.append({"key": b.key, "name": b.name, "description": b.description, "waiting": waiting})
+        sn_waiting = db.scalar(select(func.count()).select_from(SnArticle).where(SnArticle.chatbot_id == b.id, SnArticle.status.in_(QUEUE)))
+        out.append({"key": b.key, "name": b.name, "description": b.description, "waiting": waiting, "sn_waiting": sn_waiting})
     return out
 
 

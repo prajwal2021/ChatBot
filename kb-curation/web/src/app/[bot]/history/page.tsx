@@ -1,17 +1,18 @@
 "use client";
-import { BookOpenCheck, Files, History, ListChecks, Settings } from "lucide-react";
+import { BookOpenCheck, Files, History, Library, ListChecks, Settings } from "lucide-react";
 import { useMemo, useState } from "react";
 import { useApi } from "@/lib/api";
 import { useBot } from "@/components/shell";
 import { Card, Empty, ErrorNote, Loading, Page, PageHeader, Tabs } from "@/components/ui";
 import { cn } from "@/lib/utils";
 
-type Item = { id: number; area: "pages" | "review" | "publish" | "settings"; action: string; actor: string; summary: string; detail: { urls?: string[]; note?: string }; created_at: string };
+type Item = { id: number; area: "pages" | "review" | "publish" | "servicenow" | "settings"; action: string; actor: string; summary: string; detail: { urls?: string[]; note?: string }; created_at: string };
 type Area = "" | Item["area"];
 const AREA = {
   pages: { label: "Pages & crawling", icon: Files, color: "bg-blue-50 text-blue-700" },
   review: { label: "Review", icon: ListChecks, color: "bg-amber-50 text-amber-700" },
   publish: { label: "Publishing", icon: BookOpenCheck, color: "bg-emerald-50 text-emerald-700" },
+  servicenow: { label: "ServiceNow", icon: Library, color: "bg-violet-50 text-violet-700" },
   settings: { label: "Settings", icon: Settings, color: "bg-neutral-100 text-neutral-600" },
 } as const;
 
