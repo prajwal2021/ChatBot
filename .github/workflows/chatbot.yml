@@ -1,0 +1,56 @@
+name: Chatbot
+
+on:
+  push:
+    branches: [chatbot_V1]
+    paths: ["vectors/**", "chatbot-app/**", ".github/workflows/chatbot.yml"]
+  pull_request:
+    paths: ["vectors/**", "chatbot-app/**", ".github/workflows/chatbot.yml"]
+  workflow_dispatch:
+
+concurrency:
+  group: chatbot-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Chatbot backend tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: vectors
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: vectors/requirements.txt
+      - name: Install dependencies (CPU-only torch keeps the install small)
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -r requirements.txt
+      - run: python -m unittest discover -s tests -t . -v
+
+  frontend:
+    name: Chatbot frontend types and build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: chatbot-app
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: chatbot-app/package-lock.json
+      - run: npm ci
+      - name: Lint (reported, not yet required; 2 existing errors to clean up)
+        run: npx eslint .
+        continue-on-error: true
+      - run: npx tsc --noEmit
+      - run: npm run build
+        env:
+          NEXT_PUBLIC_API_URL: https://tosmonline0001.ttu.edu/chatbot-api
+          NEXT_TELEMETRY_DISABLED: "1"
