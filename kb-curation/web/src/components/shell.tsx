@@ -1,5 +1,5 @@
 "use client";
-import { BookOpenCheck, Check, ChevronsUpDown, FileText, GitCompareArrows, Globe, History, LayoutDashboard, ListChecks, Plus, Target, Rocket, Settings, UserRound, Files } from "lucide-react";
+import { BookOpenCheck, Check, ChevronsUpDown, FileText, FolderTree, GitCompareArrows, Globe, History, LayoutDashboard, Library, ListChecks, Plus, Target, Rocket, Settings, UserRound, Files } from "lucide-react";
 import Link from "next/link";
 import { useParams, usePathname, useRouter } from "next/navigation";
 import { useEffect, useRef, useState, type ReactNode } from "react";
@@ -7,9 +7,9 @@ import { api, reviewer, useApi } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { Button, inputCls, Label, Modal, useToast } from "./ui";
 
-type Bot = { key: string; name: string; description: string; waiting: number };
+type Bot = { key: string; name: string; description: string; waiting: number; sn_waiting?: number };
 
-const NAV: { group?: string; items: { href: string; label: string; icon: typeof Globe; badge?: boolean }[] }[] = [
+const NAV: { group?: string; items: { href: string; label: string; icon: typeof Globe; badge?: "web" | "sn"; exact?: boolean }[] }[] = [
   { items: [{ href: "", label: "Overview", icon: LayoutDashboard }] },
   { group: "Collect", items: [
     { href: "/sources", label: "Sources", icon: Globe },
@@ -18,12 +18,20 @@ const NAV: { group?: string; items: { href: string; label: string; icon: typeof 
   ] },
   { group: "Curate", items: [
     { href: "/scope", label: "Ryan's KB", icon: Target },
-    { href: "/review", label: "Review", icon: ListChecks, badge: true },
+    { href: "/review", label: "Review", icon: ListChecks, badge: "web" },
     { href: "/publish", label: "Publish", icon: Rocket },
   ] },
   { group: "Deliver", items: [
     { href: "/kb", label: "Knowledge base", icon: BookOpenCheck },
     { href: "/document", label: "Document", icon: FileText },
+  ] },
+  { group: "ServiceNow", items: [
+    { href: "/servicenow", label: "Overview", icon: Library, exact: true },
+    { href: "/servicenow/categories", label: "Categories & links", icon: FolderTree },
+    { href: "/servicenow/changes", label: "Changes", icon: GitCompareArrows },
+    { href: "/servicenow/review", label: "Review", icon: ListChecks, badge: "sn" },
+    { href: "/servicenow/publish", label: "Publish", icon: Rocket },
+    { href: "/servicenow/kb", label: "Knowledge base", icon: BookOpenCheck },
   ] },
   { group: "Audit", items: [{ href: "/history", label: "History", icon: History }] },
 ];
@@ -94,12 +102,13 @@ export function Shell({ children }: { children: ReactNode }) {
               {g.group && <div className="px-2.5 pb-1 text-[11px] font-medium uppercase tracking-wider text-neutral-400">{g.group}</div>}
               {g.items.map((it) => {
                 const href = `/${bot}${it.href}`;
-                const active = it.href === "" ? path === href : path.startsWith(href);
+                const active = it.href === "" || it.exact ? path === href : path.startsWith(href);
+                const count = it.badge === "web" ? current?.waiting : it.badge === "sn" ? current?.sn_waiting : 0;
                 return (
                   <Link key={it.href} href={href} className={cn("mb-0.5 flex h-8 items-center gap-2.5 rounded-lg px-2.5 text-[13px] font-medium transition-colors", active ? "bg-neutral-200/70 text-ink" : "text-neutral-600 hover:bg-neutral-200/40 hover:text-ink")}>
                     <it.icon className="size-4" strokeWidth={1.8} />
                     <span className="flex-1">{it.label}</span>
-                    {it.badge && !!current?.waiting && <span className="rounded-full bg-ink px-1.5 py-px text-[11px] font-medium tabular-nums text-white">{current.waiting > 999 ? "999+" : current.waiting}</span>}
+                    {!!count && <span className="rounded-full bg-ink px-1.5 py-px text-[11px] font-medium tabular-nums text-white">{count > 999 ? "999+" : count}</span>}
                   </Link>
                 );
               })}

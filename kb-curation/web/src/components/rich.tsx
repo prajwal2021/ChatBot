@@ -1,7 +1,16 @@
 import { Fragment, type ReactNode } from "react";
+import { API } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
-type Block = { type: "p" | "bullet" | "step"; text: string; indent: number } | { type: "table"; rows: string[][] };
+type Block = { type: "p" | "bullet" | "step" | "h2" | "h3"; text: string; indent: number } | { type: "table"; rows: string[][] } | { type: "img"; alt: string; src: string };
+
+const IMG = /^!\[([^\]]*)\]\(([^)\s]+)\)$/;
+
+/** Images copied from ServiceNow are stored as sn-asset:<id> and served by the API. */
+function imageSrc(src: string): string | null {
+  if (src.startsWith("sn-asset:")) return `${API}/api/servicenow/assets/${src.slice(9)}`;
+  return /^https?:\/\//.test(src) ? src : null;
+}
 
 function blocks(content: string): Block[] {
   const out: Block[] = [];
@@ -18,7 +27,11 @@ function blocks(content: string): Block[] {
     const indent = Math.floor((ln.length - ln.trimStart().length) / 2);
     const s = ln.trim();
     if (!s) continue;
-    if (s.startsWith("- ")) out.push({ type: "bullet", text: s.slice(2), indent });
+    const im = s.match(IMG);
+    if (im) out.push({ type: "img", alt: im[1], src: im[2] });
+    else if (s.startsWith("### ")) out.push({ type: "h3", text: s.slice(4), indent: 0 });
+    else if (s.startsWith("## ")) out.push({ type: "h2", text: s.slice(3), indent: 0 });
+    else if (s.startsWith("- ")) out.push({ type: "bullet", text: s.slice(2), indent });
     else if (/^\d+\. /.test(s)) out.push({ type: "step", text: s, indent });
     else out.push({ type: "p", text: s, indent: 0 });
   }
@@ -57,6 +70,13 @@ export function Rich({ content, className }: { content: string; className?: stri
               </table>
             </div>
           );
+        if (b.type === "img") {
+          const src = imageSrc(b.src);
+          // eslint-disable-next-line @next/next/no-img-element -- images come from the API at run time
+          return src ? <img key={i} src={src} alt={b.alt} loading="lazy" className="max-h-[420px] max-w-full rounded-lg border border-line" /> : null;
+        }
+        if (b.type === "h2") return <p key={i} className="pt-2 text-[15px] font-semibold text-ink">{inline(b.text)}</p>;
+        if (b.type === "h3") return <p key={i} className="pt-1 font-semibold text-ink">{inline(b.text)}</p>;
         if (b.type === "bullet")
           return (
             <div key={i} className="flex gap-2" style={{ paddingLeft: 4 + b.indent * 18 }}>
