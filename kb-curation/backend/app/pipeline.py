@@ -16,7 +16,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from . import categorize, verify
-from .crawler import Fetched, crawl
+from .crawler import Fetched, crawl, original_first
 from .db import SessionLocal
 from .diffing import line_diff, similar
 from .extract import sha
@@ -291,7 +291,7 @@ def verify_results(db: Session, bot: Chatbot, results: dict[str, Fetched], progr
     """Fill f.checks for every fetched page whose content is new or changed since its last verdict."""
     known = {p.url: p for p in db.scalars(select(Page).where(Page.chatbot_id == bot.id))}
     first_with: dict[str, str] = {}
-    for f in sorted((f for f in results.values() if f.kind == "page"), key=lambda x: (x.via != "link", x.depth, len(x.url), x.url)):
+    for f in sorted((f for f in results.values() if f.kind == "page"), key=original_first):
         first_with.setdefault(f.data["hash"], f.url)          # the page people actually reach is the original
     todo: list[tuple[str, dict]] = []
     for f in results.values():

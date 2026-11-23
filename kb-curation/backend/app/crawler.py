@@ -14,7 +14,7 @@ from urllib.parse import urlsplit, urlunsplit
 import httpx
 
 from .config import USER_AGENT
-from .extract import extract
+from .extract import extract, page_text, sha
 
 FILE_EXT = re.compile(r"\.(pdf|docx?|xlsx?|pptx?|csv|txt|rtf|zip|rar|7z|gz|png|jpe?g|gif|svg|webp|ico|bmp|tiff?|mp[34]|mov|avi|wmv|m4[av]|wav"
                       r"|css|js|json|xml|ics|vcf|eps|ai|psd|pub|exe|dmg)$", re.I)
@@ -194,4 +194,24 @@ def crawl(root_url: str, max_pages: int, known: list[str] | None = None, on_prog
             left += run(extra, "sitemap")
     for url, depth in left:                                   # found but over the page limit
         results.setdefault(url, Fetched(url, depth, "skipped", None, f"Over the page limit ({max_pages}) for this source"))
+    attach_contacts(results)
     return results
+
+
+def original_first(f: Fetched) -> tuple:
+    """Sort key: among pages with the same content, the one people reach by clicking, nearest the home page."""
+    return f.via != "link", f.depth, len(f.url), f.url
+
+
+def attach_contacts(results: dict[str, Fetched]) -> None:
+    """Each distinct contact block becomes a section of only the first page showing it; the others drop it.
+    shortcut: owner is picked per crawl, so if that page fails to load the block moves to the next page for one
+    run (one new + one removal proposal); make ownership sticky in the database if that churn shows up."""
+    taken: set[str] = set()
+    for f in sorted((f for f in results.values() if f.kind == "page"), key=original_first):
+        c = f.data.pop("contact", None)
+        if c and c["hash"] not in taken:
+            taken.add(c["hash"])
+            f.data["sections"].append(c)
+            f.data["text"] = page_text(f.data["sections"])
+            f.data["hash"] = sha(f.data["text"])
