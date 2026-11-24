@@ -21,6 +21,14 @@ cd ../web && npm install && npm run dev -- -p 3010                       # UI   
 
 Tables are created on first start, with two chatbots (TTU K-12, TTU Online), their source URLs and starter categories.
 
+Everyone signs in. Add a reviewer (it asks for the password; run it again on the same name to reset it):
+
+```bash
+cd backend && .venv/bin/python -m app.users add "Jane Doe"     # Docker: docker compose exec api python -m app.users add "Jane Doe"
+```
+
+Users change their own password on the Settings page.
+
 ## How it works
 
 | Step | Code | Notes |
