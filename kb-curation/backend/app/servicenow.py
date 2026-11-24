@@ -31,6 +31,8 @@ STATE_LABEL = {"draft": "Draft in ServiceNow", "review": "In review in ServiceNo
 EXPIRED = "Expired in ServiceNow"
 NEWER = "Newer version in ServiceNow"
 STATE_WORD = {"draft": "draft", "review": "in-review", "pending_retirement": "pending-retirement", "published": "published"}
+# Review flags: they say where the record stood in ServiceNow or what the AI did, which helps a reviewer decide but is
+# not knowledge. They are shown in Review and never kept on approved text or sent to the chatbot.
 SYSTEM_LABELS = {EXPIRED, NEWER, "AI update", "New from link", "AI suggests removing", *STATE_LABEL.values()}
 
 
@@ -268,7 +270,7 @@ def approve(db: Session, a: SnArticle, actor: str) -> None:
     kind = "change_approved" if a.content is not None else "approved"
     a.title, a.content = a.p_title, a.p_content
     a.category_id = a.p_category_id if a.p_category_id is not None else a.category_id
-    a.labels = [x for x in a.p_labels or [] if x not in ("AI update", "New from link", "AI suggests removing", NEWER)]
+    a.labels = [x for x in a.p_labels or [] if x not in SYSTEM_LABELS]
     a.revision += 1
     a.status, a.reviewer, a.reviewed_at = "approved", actor, now()
     clear_proposal(a)
@@ -572,7 +574,7 @@ def live_items(db: Session, bot: Chatbot) -> list[dict]:
         items.append({
             "entry_id": a.id, "title": a.title, "content": a.content, "category_id": a.category_id,
             "category": c.path if c else "Uncategorized", "category_position": c.position if c else 99999, "color": "slate",
-            "secondary": [], "labels": [x for x in a.labels or [] if x not in ("AI update", "New from link")],
+            "secondary": [], "labels": [x for x in a.labels or [] if x not in SYSTEM_LABELS],
             "number": a.number, "source_url": kb_url(a.number), "source_title": a.number,
             "manual_edit": False, "revision": a.revision, "_order": (a.number or "~", a.id),
         })
@@ -610,10 +612,30 @@ def publish_version(db: Session, bot: Chatbot, note: str, actor: str) -> SnVersi
     return v
 
 
-if __name__ == "__main__":                                     # python -m app.servicenow merge-versions
+def clear_review_flags(db: Session, bot: Chatbot, actor: str = "system") -> int:
+    """Remove review flags from approved text (articles approved before flags were left out on approval)."""
+    n = 0
+    for a in db.scalars(select(SnArticle).where(SnArticle.chatbot_id == bot.id, SnArticle.status.in_(LIVE))):
+        kept = [x for x in a.labels or [] if x not in SYSTEM_LABELS]
+        if kept != list(a.labels or []):
+            log(db, a, "flags_cleared", actor, removed=[x for x in a.labels or [] if x in SYSTEM_LABELS])
+            a.labels = kept
+            n += 1
+    if n:
+        record(db, bot.id, "clear_flags", actor, f"Removed ServiceNow workflow labels (draft, in review, pending retirement, "
+               f"expired) from the approved text of {n} articles; they stay visible in Review only")
+    db.commit()
+    return n
+
+
+if __name__ == "__main__":                       # python -m app.servicenow merge-versions | clear-flags
     import sys as _sys
-    if _sys.argv[1:] != ["merge-versions"]:
-        _sys.exit("usage: python -m app.servicenow merge-versions")
+    cmd = _sys.argv[1:]
+    if cmd not in (["merge-versions"], ["clear-flags"]):
+        _sys.exit("usage: python -m app.servicenow merge-versions | clear-flags")
     with SessionLocal() as _db:
         for _bot in _db.scalars(select(Chatbot).order_by(Chatbot.id)).all():
-            print(_bot.key, merge_versions(_db, _bot, "Duplicate clean-up"))
+            if cmd == ["merge-versions"]:
+                print(_bot.key, merge_versions(_db, _bot, "Duplicate clean-up"))
+            else:
+                print(_bot.key, "articles cleaned:", clear_review_flags(_db, _bot, "Label clean-up"))

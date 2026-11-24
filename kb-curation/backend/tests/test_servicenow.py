@@ -213,3 +213,22 @@ def test_versions_collapse_to_one_article_per_number(env):
     sn.approve(s, kept, "t")
     assert kept.content == "Fee is $55." and sn.NEWER not in kept.labels
     assert sn.merge_versions(s, bot, "t") == {"numbers": 0, "removed": 0, "proposals": 0}
+
+
+@pytestmark_db
+def test_servicenow_workflow_labels_never_reach_published_knowledge(env):
+    s, bot, sn = env
+    from app.models import SnArticle
+
+    st = sn.import_kb(s, bot, KB, "t")
+    a = s.query(SnArticle).filter_by(number="KB2").one()        # a draft in ServiceNow, flagged "Internal only"
+    assert "Draft in ServiceNow" in a.p_labels                   # the reviewer sees where it stood in ServiceNow
+    sn.approve(s, a, "t")
+    assert "Draft in ServiceNow" not in a.labels and "Internal only" in a.labels
+
+    old = s.query(SnArticle).filter_by(number="KB1").one()        # approved before this fix, flags still on it
+    sn.approve(s, old, "t")
+    old.labels = ["Expired in ServiceNow", "In review in ServiceNow", "Fees"]
+    s.commit()
+    assert all("ServiceNow" not in l for it in sn.live_items(s, bot) for l in it["labels"])
+    assert sn.clear_review_flags(s, bot, "t") == 1 and old.labels == ["Fees"]
