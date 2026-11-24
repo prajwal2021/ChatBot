@@ -1,5 +1,5 @@
 "use client";
-import { AlertCircle, CheckCircle2, ChevronRight, ExternalLink, FolderTree, Link2, Loader2, Plus, RefreshCw, Search, Sparkles, Trash2 } from "lucide-react";
+import { AlertCircle, CheckCircle2, ChevronRight, CornerLeftUp, ExternalLink, FolderTree, Link2, Link2Off, Loader2, Plus, RefreshCw, Search, Sparkles, Trash2 } from "lucide-react";
 import Link from "next/link";
 import { useMemo, useState } from "react";
 import { api, useApi } from "@/lib/api";
@@ -21,22 +21,31 @@ export default function SnCategoriesPage() {
   const [q, setQ] = useState("");
   const [open, setOpen] = useState<number | null>(null);
   const [hideEmpty, setHideEmpty] = useState(false);
+  const [view, setView] = useState<"all" | "watched" | "missing">("all");
   const cats = useApi<Cats>(`/api/chatbots/${bot}/servicenow/categories`, 10000);
   const all = useMemo(() => cats.data?.categories ?? [], [cats.data]);
   const links = all.flatMap((c) => c.links);
-  const byId = useMemo(() => new Map(all.map((c) => [c.id, c])), [all]);
+  const { byId, cover } = useMemo(() => {
+    const m = new Map(all.map((c) => [c.id, c]));
+    return { byId: m, cover: coverage(all, m) };
+  }, [all]);
+  const withArticles = all.filter((c) => c.total > 0);
+  const watched = withArticles.filter((c) => cover.get(c.id)?.kind !== "none").length;
+  const errors = links.filter((l) => l.status === "error").length;
 
-  // a category is shown when it, or anything below it, matches the search and holds articles
+  // a category is shown when it, or anything below it, matches the search and the view
   const shown = useMemo(() => {
     const ql = q.toLowerCase().trim();
     const keep = new Set<number>();
     for (const c of all) {
-      const hit = (!ql || c.path.toLowerCase().includes(ql)) && (!hideEmpty || c.total > 0 || c.links.length > 0);
+      const k = cover.get(c.id)?.kind;
+      const inView = view === "all" || (view === "watched" ? c.links.length > 0 || (c.total > 0 && k === "parent") : c.total > 0 && k === "none");
+      const hit = inView && (!ql || c.path.toLowerCase().includes(ql)) && (!hideEmpty || c.total > 0 || c.links.length > 0);
       if (!hit) continue;
       for (let x: SnCategory | undefined = c; x; x = x.parent_id ? byId.get(x.parent_id) : undefined) keep.add(x.id);
     }
     return all.filter((c) => keep.has(c.id));
-  }, [all, q, hideEmpty, byId]);
+  }, [all, q, hideEmpty, byId, view, cover]);
   const current = open ? byId.get(open) : undefined;
 
   return (
@@ -46,11 +55,19 @@ export default function SnCategoriesPage() {
         description="The categories exactly as they are in ServiceNow. Add the web pages each category's articles come from: when a page changes, the AI reads the change and proposes edits, new articles or removals for review."
       />
       {cats.error && <ErrorNote>{cats.error}</ErrorNote>}
+      {cats.data && withArticles.length > 0 && (
+        <div className="mb-5 grid grid-cols-3 gap-3">
+          <Summary icon={<Link2 className="size-4" />} tone="violet" value={`${watched} of ${withArticles.length}`} label="categories with articles are watched by a link" />
+          <Summary icon={<CheckCircle2 className="size-4" />} tone={errors ? "red" : "green"} value={String(links.length)} label={errors ? `links · ${errors} could not be read` : "links, all readable"} />
+          <Summary icon={<Link2Off className="size-4" />} tone="amber" value={String(withArticles.length - watched)} label="categories with articles have no link yet" onClick={() => { setTab("categories"); setView("missing"); }} />
+        </div>
+      )}
       <div className="mb-4 flex flex-wrap items-center gap-3">
         <Tabs value={tab} onChange={setTab} items={[{ value: "categories", label: "Categories", count: all.length }, { value: "links", label: "All links", count: links.length }]} />
         {tab === "categories" && (
           <>
-            <div className="relative w-72">
+            <Tabs value={view} onChange={setView} items={[{ value: "all", label: "All" }, { value: "watched", label: "Watched", count: watched }, { value: "missing", label: "Needs a link", count: withArticles.length - watched }]} />
+            <div className="relative w-64">
               <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-neutral-400" />
               <input className={cn(inputCls, "pl-9")} placeholder="Find a category" value={q} onChange={(e) => setQ(e.target.value)} />
             </div>
@@ -66,11 +83,12 @@ export default function SnCategoriesPage() {
       ) : (
         <Card className="divide-y divide-line overflow-hidden">
           {shown.map((c) => (
-            <button key={c.id} onClick={() => setOpen(c.id)} className="flex w-full items-center gap-3 px-4 py-2.5 text-left hover:bg-subtle">
+            <button key={c.id} onClick={() => setOpen(c.id)} className={cn("relative flex w-full items-center gap-3 px-4 py-2.5 text-left hover:bg-subtle", c.links.length > 0 && "bg-violet-50/40")}>
+              {c.links.length > 0 && <span className="absolute inset-y-0 left-0 w-[3px] bg-violet-500" aria-hidden />}
               <span style={{ width: c.depth * 20 }} className="shrink-0" />
               <FolderTree className={cn("size-4 shrink-0", c.total ? "text-neutral-500" : "text-neutral-300")} />
               <span className={cn("min-w-0 flex-1 truncate text-[13px]", c.total ? "font-medium" : "text-muted")}>{c.name}{!c.active && <span className="ml-2 text-xs text-muted">(inactive in ServiceNow)</span>}</span>
-              {c.links.length > 0 && <LinkChip links={c.links} />}
+              <CoverageChip c={c} cover={cover.get(c.id)} />
               <span className="w-28 shrink-0 text-right text-xs tabular-nums text-muted">{c.total ? plural(c.total, "article") : "—"}</span>
               <span className="w-20 shrink-0 text-right">{c.waiting > 0 && <Badge tone="blue">{c.waiting} waiting</Badge>}</span>
               <ChevronRight className="size-4 shrink-0 text-neutral-300" />
@@ -79,18 +97,53 @@ export default function SnCategoriesPage() {
           {shown.length === 0 && <p className="px-5 py-8 text-center text-sm text-muted">No category matches.</p>}
         </Card>
       )}
-      {current && <CategoryDrawer bot={bot} cat={current} onClose={() => setOpen(null)} onChanged={cats.reload} />}
+      {current && <CategoryDrawer bot={bot} cat={current} inherited={cover.get(current.id)} onClose={() => setOpen(null)} onChanged={cats.reload} />}
     </Page>
   );
 }
 
-function LinkChip({ links }: { links: SnLink[] }) {
-  const bad = links.some((l) => l.status === "error");
-  const busy = links.some((l) => l.status === "checking" || l.status === "pending");
+type Cover = { kind: "own" | "parent" | "none"; from?: SnCategory };
+
+/** How each category is watched: its own links, a link on a parent (which covers everything below it), or nothing.
+ *  Links pinned to one article only cover that article, so they don't count for the categories below. */
+function coverage(all: SnCategory[], byId: Map<number, SnCategory>): Map<number, Cover> {
+  const out = new Map<number, Cover>();
+  for (const c of all) {
+    if (c.links.length) { out.set(c.id, { kind: "own" }); continue; }
+    let p = c.parent_id ? byId.get(c.parent_id) : undefined;
+    while (p && !p.links.some((l) => !l.article_id)) p = p.parent_id ? byId.get(p.parent_id) : undefined;
+    out.set(c.id, p ? { kind: "parent", from: p } : { kind: "none" });
+  }
+  return out;
+}
+
+function CoverageChip({ c, cover }: { c: SnCategory; cover?: Cover }) {
+  if (c.links.length) {
+    const bad = c.links.filter((l) => l.status === "error").length;
+    const busy = c.links.some((l) => l.status === "checking" || l.status === "pending");
+    const names = c.links.map((l) => `${l.label || l.title || shortUrl(l.url)}${l.status === "error" ? " (could not be read)" : ""}`).join("\n");
+    return (
+      <span title={names} className={cn("inline-flex shrink-0 items-center gap-1.5 rounded-full px-2.5 py-0.5 text-xs font-medium", bad ? "bg-red-50 text-red-700 ring-1 ring-red-200" : "bg-violet-100 text-violet-800")}>
+        {busy ? <Loader2 className="size-3 animate-spin" /> : bad ? <AlertCircle className="size-3" /> : <Link2 className="size-3" />}
+        {plural(c.links.length, "link")}
+        {!busy && <span className={cn("size-1.5 rounded-full", bad ? "bg-red-500" : "bg-emerald-500")} aria-label={bad ? "error" : "watching"} />}
+      </span>
+    );
+  }
+  if (cover?.kind === "parent" && cover.from && c.total > 0)
+    return <span title={`Watched through the links on “${cover.from.path}”`} className="inline-flex shrink-0 items-center gap-1 rounded-full border border-violet-200 px-2 py-0.5 text-xs text-violet-700"><CornerLeftUp className="size-3" /> via {cover.from.name}</span>;
+  if (c.total > 0) return <span title="These articles are not watched by any web page" className="inline-flex shrink-0 items-center gap-1 rounded-full bg-amber-50 px-2 py-0.5 text-xs text-amber-800"><Link2Off className="size-3" /> No link</span>;
+  return null;
+}
+
+function Summary({ icon, tone, value, label, onClick }: { icon: React.ReactNode; tone: "violet" | "green" | "red" | "amber"; value: string; label: string; onClick?: () => void }) {
+  const tones = { violet: "bg-violet-50 text-violet-700", green: "bg-emerald-50 text-emerald-700", red: "bg-red-50 text-red-700", amber: "bg-amber-50 text-amber-700" };
+  const Tag = onClick ? "button" : "div";
   return (
-    <span className={cn("inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs font-medium", bad ? "bg-red-50 text-red-700" : "bg-violet-50 text-violet-700")}>
-      {busy ? <Loader2 className="size-3 animate-spin" /> : <Link2 className="size-3" />}{links.length}
-    </span>
+    <Tag onClick={onClick} className={cn("flex items-center gap-3 rounded-2xl border border-line bg-white p-4 text-left", onClick && "hover:border-neutral-300")}>
+      <span className={cn("flex size-9 shrink-0 items-center justify-center rounded-xl", tones[tone])}>{icon}</span>
+      <span className="min-w-0"><span className="block text-lg font-semibold tabular-nums leading-tight">{value}</span><span className="block text-xs text-muted">{label}</span></span>
+    </Tag>
   );
 }
 
@@ -118,7 +171,7 @@ function LinkTable({ links, onOpen }: { links: SnLink[]; onOpen: (categoryId: nu
   );
 }
 
-function CategoryDrawer({ bot, cat, onClose, onChanged }: { bot: string; cat: SnCategory; onClose: () => void; onChanged: () => void }) {
+function CategoryDrawer({ bot, cat, inherited, onClose, onChanged }: { bot: string; cat: SnCategory; inherited?: Cover; onClose: () => void; onChanged: () => void }) {
   const toast = useToast();
   const arts = useApi<{ total: number; articles: SnArticle[] }>(`/api/chatbots/${bot}/servicenow/articles?status=new,changed,removal,approved&category=${cat.id}&limit=500`);
   const [adding, setAdding] = useState(false);
@@ -155,6 +208,12 @@ function CategoryDrawer({ bot, cat, onClose, onChanged }: { bot: string; cat: Sn
         <h3 className="font-semibold">Links <span className="font-normal text-muted">{cat.links.length}</span></h3>
         <Button size="sm" variant="primary" onClick={() => setAdding(true)}><Plus className="size-3.5" /> Add link</Button>
       </div>
+      {inherited?.kind === "parent" && inherited.from && (
+        <div className="mb-3 flex items-start gap-2 rounded-xl border border-violet-200 bg-violet-50/60 px-3 py-2.5 text-[13px] text-violet-900">
+          <CornerLeftUp className="mt-0.5 size-3.5 shrink-0" />
+          <span>Already watched through {plural(inherited.from.links.filter((l) => !l.article_id).length, "link")} on <b>{inherited.from.path}</b>, which also cover this category. Add a link here only for a page specific to these articles.</span>
+        </div>
+      )}
       <p className="mb-3 text-[13px] text-muted">Pages added here are compared with the articles in this category{cat.depth >= 0 ? " and the categories inside it" : ""}. The first read only records the page; from then on every change is sent to the AI.</p>
       {cat.links.length === 0 ? (
         <div className="rounded-xl border border-dashed border-line px-4 py-6 text-center text-[13px] text-muted">No links on this category yet.</div>
