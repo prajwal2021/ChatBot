@@ -16,14 +16,12 @@ from .config import DATA_DIR, PUBLIC_API_BASE, SN_IMPORT_TOKEN, SN_MODEL
 from .db import get_db
 from .diffing import line_diff
 from .models import Activity, Chatbot, SnArticle, SnArticleEvent, SnAsset, SnCategory, SnLink, SnLinkEvent, SnVersion
+from .users import actor, current_user
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(current_user)])   # every ServiceNow screen needs a signed-in reviewer
+public = APIRouter()   # image files linked from published exports, and the import guarded by its own token
 ASSETS = DATA_DIR / "servicenow" / "assets"
 IMAGE_TYPES = {"image/png", "image/jpeg", "image/gif", "image/webp", "image/bmp", "image/svg+xml", "image/tiff", "image/x-icon"}
-
-
-def actor(x_reviewer: str | None = Header(default=None)) -> str:
-    return (x_reviewer or "").strip()[:80] or "Reviewer"
 
 
 def get_bot(key: str, db: Session = Depends(get_db)) -> Chatbot:
@@ -429,7 +427,7 @@ def export(request: Request, format: str = "json", version: int | None = None, b
 
 # ── images copied from ServiceNow ─────────────────────────────────────────────
 
-@router.get("/api/servicenow/assets/{sid}")
+@public.get("/api/servicenow/assets/{sid}")
 def asset(sid: str, db: Session = Depends(get_db)):
     if not re.fullmatch(r"[0-9a-f]{32}", sid):
         raise HTTPException(404)
@@ -451,26 +449,26 @@ def import_auth(x_import_token: str | None = Header(default=None)) -> None:
         raise HTTPException(403, "Wrong import token.")
 
 
-@router.post("/api/servicenow/import/{key}", dependencies=[Depends(import_auth)])
-async def import_kb(request: Request, key: str, who: str = Depends(actor), db: Session = Depends(get_db)):
+@public.post("/api/servicenow/import/{key}", dependencies=[Depends(import_auth)])
+async def import_kb(request: Request, key: str, db: Session = Depends(get_db)):
     bot = get_bot(key, db)
     kb = json.loads(await request.body())
     if not isinstance(kb, dict) or not isinstance(kb.get("articles"), list):
         raise HTTPException(400, "Expected {categories: [...], articles: [...]}")
-    return sn.import_kb(db, bot, kb, who)
+    return sn.import_kb(db, bot, kb, "ServiceNow import")  # sent with a token, not a signed-in session
 
 
 class IdsIn(BaseModel):
     ids: list[str]
 
 
-@router.post("/api/servicenow/import-assets/missing", dependencies=[Depends(import_auth)])
+@public.post("/api/servicenow/import-assets/missing", dependencies=[Depends(import_auth)])
 def missing_assets(b: IdsIn, db: Session = Depends(get_db)):
     have = set(db.scalars(select(SnAsset.sys_id).where(SnAsset.sys_id.in_([i.lower() for i in b.ids]))))
     return {"missing": [i for i in dict.fromkeys(x.lower() for x in b.ids[:5000]) if i not in have]}
 
 
-@router.post("/api/servicenow/import-assets/{sid}", dependencies=[Depends(import_auth)])
+@public.post("/api/servicenow/import-assets/{sid}", dependencies=[Depends(import_auth)])
 async def upload_asset(sid: str, request: Request, db: Session = Depends(get_db)):
     sid = sid.lower()
     if not re.fullmatch(r"[0-9a-f]{32}", sid):

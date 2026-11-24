@@ -3,18 +3,16 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 export const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8010";
 
-export function reviewer(): string {
-  if (typeof window === "undefined") return "Reviewer";
-  return localStorage.getItem("kb-reviewer") || "Reviewer";
-}
-
 export async function api<T = unknown>(path: string, opts: { method?: string; body?: unknown } = {}): Promise<T> {
   const r = await fetch(API + path, {
     method: opts.method ?? (opts.body ? "POST" : "GET"),
-    headers: { "Content-Type": "application/json", "X-Reviewer": reviewer() },
+    headers: { "Content-Type": "application/json" },
     body: opts.body ? JSON.stringify(opts.body) : undefined,
     cache: "no-store",
+    credentials: "include", // send the login cookie to the API, which may be on another port
   });
+  // signed out or session expired: go to the login page (login itself shows its own error)
+  if (r.status === 401 && path !== "/api/login") window.location.assign(`${process.env.NEXT_PUBLIC_BASE_PATH}/login`);
   if (!r.ok) {
     let msg = `Request failed (${r.status})`;
     try {

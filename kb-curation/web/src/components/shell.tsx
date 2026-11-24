@@ -1,15 +1,17 @@
 "use client";
-import { BookOpenCheck, Check, ChevronsUpDown, FileText, FolderTree, GitCompareArrows, Globe, History, LayoutDashboard, Library, ListChecks, Plus, Target, Rocket, Settings, UserRound, Files } from "lucide-react";
+import { BookOpenCheck, Check, ChevronsUpDown, FileText, FolderTree, GitCompareArrows, Globe, History, LayoutDashboard, Library, ListChecks, LogOut, Plus, Target, Rocket, Settings, UserRound, Files } from "lucide-react";
 import Link from "next/link";
 import { useParams, usePathname, useRouter } from "next/navigation";
 import { useEffect, useRef, useState, type ReactNode } from "react";
-import { api, reviewer, useApi } from "@/lib/api";
+import { api, useApi } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { Button, inputCls, Label, Modal, useToast } from "./ui";
 
 type Bot = { key: string; name: string; description: string; waiting: number; sn_waiting?: number };
 
 const NAV: { group?: string; items: { href: string; label: string; icon: typeof Globe; badge?: "web" | "sn"; exact?: boolean }[] }[] = [
+  // Previous architecture, hidden for now:
+  /*
   { items: [{ href: "", label: "Overview", icon: LayoutDashboard }] },
   { group: "Collect", items: [
     { href: "/sources", label: "Sources", icon: Globe },
@@ -25,6 +27,7 @@ const NAV: { group?: string; items: { href: string; label: string; icon: typeof 
     { href: "/kb", label: "Knowledge base", icon: BookOpenCheck },
     { href: "/document", label: "Document", icon: FileText },
   ] },
+  */
   { group: "ServiceNow", items: [
     { href: "/servicenow", label: "Overview", icon: Library, exact: true },
     { href: "/servicenow/categories", label: "Categories & links", icon: FolderTree },
@@ -48,14 +51,14 @@ export function Shell({ children }: { children: ReactNode }) {
   const { data: bots, reload } = useApi<Bot[]>("/api/chatbots", 8000);
   const [open, setOpen] = useState(false);
   const [adding, setAdding] = useState(false);
-  const [naming, setNaming] = useState(false);
-  const [who, setWho] = useState("Reviewer");
+  const { data: me } = useApi<{ name: string }>("/api/me");
   const menu = useRef<HTMLDivElement>(null);
   const current = bots?.find((b) => b.key === bot);
 
-  // localStorage is only available in the browser, so the name is read after mount
-  // eslint-disable-next-line react-hooks/set-state-in-effect
-  useEffect(() => setWho(reviewer()), []);
+  const logout = async () => {
+    try { await api("/api/logout", { body: {} }); } catch { /* signed out already: still go to the login page */ }
+    router.replace("/login");
+  };
   useEffect(() => {
     const h = (e: MouseEvent) => menu.current && !menu.current.contains(e.target as Node) && setOpen(false);
     window.addEventListener("mousedown", h);
@@ -82,9 +85,9 @@ export function Shell({ children }: { children: ReactNode }) {
           {open && (
             <div className="rise absolute left-3 right-3 top-full z-30 mt-1 rounded-xl border border-line bg-white p-1 shadow-lg">
               {bots?.map((b) => (
-                <button key={b.key} onClick={() => { setOpen(false); router.push(`/${b.key}`); }} className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-[13px] hover:bg-neutral-100">
+                <button key={b.key} onClick={() => { setOpen(false); router.push(`/${b.key}/servicenow`); }} className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-[13px] hover:bg-neutral-100">
                   <span className="flex-1 truncate font-medium">{b.name}</span>
-                  {b.waiting > 0 && <span className="text-xs tabular-nums text-muted">{b.waiting}</span>}
+                  {!!b.sn_waiting && <span className="text-xs tabular-nums text-muted">{b.sn_waiting}</span>}
                   {b.key === bot && <Check className="size-3.5" />}
                 </button>
               ))}
@@ -120,30 +123,29 @@ export function Shell({ children }: { children: ReactNode }) {
           <Link href={`/${bot}/settings`} className={cn("mb-0.5 flex h-8 items-center gap-2.5 rounded-lg px-2.5 text-[13px] font-medium", path.endsWith("/settings") ? "bg-neutral-200/70" : "text-neutral-600 hover:bg-neutral-200/40")}>
             <Settings className="size-4" strokeWidth={1.8} /> Settings
           </Link>
-          <button onClick={() => setNaming(true)} className="flex h-9 w-full items-center gap-2.5 rounded-lg px-2.5 text-left text-[13px] hover:bg-neutral-200/40">
+          <div className="flex h-9 items-center gap-2.5 px-2.5 text-[13px]">
             <span className="flex size-6 items-center justify-center rounded-full bg-neutral-200 text-neutral-600"><UserRound className="size-3.5" /></span>
-            <span className="min-w-0 flex-1 truncate font-medium">{who}</span>
-          </button>
+            <span className="min-w-0 flex-1 truncate font-medium">{me?.name}</span>
+            <button onClick={logout} title="Log out" aria-label="Log out" className="rounded-md p-1 text-neutral-500 hover:bg-neutral-200/60 hover:text-neutral-800"><LogOut className="size-4" /></button>
+          </div>
         </div>
       </aside>
 
       <main className="scroll-thin min-w-0 flex-1 overflow-y-auto">{children}</main>
 
-      {adding && <NewBot onClose={() => setAdding(false)} onDone={(k) => { setAdding(false); reload(); router.push(`/${k}/sources`); toast("Chatbot created. Add or check its source URLs, then run a crawl."); }} />}
-      {naming && <Rename who={who} onClose={() => setNaming(false)} onDone={(n) => { setWho(n); setNaming(false); }} />}
+      {adding && <NewBot onClose={() => setAdding(false)} onDone={(k) => { setAdding(false); reload(); router.push(`/${k}/servicenow`); toast("Chatbot created."); }} />}
     </div>
   );
 }
 
 function NewBot({ onClose, onDone }: { onClose: () => void; onDone: (key: string) => void }) {
   const [name, setName] = useState("");
-  const [url, setUrl] = useState("");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
   const save = async () => {
     setBusy(true);
     try {
-      const r = await api<{ key: string }>("/api/chatbots", { body: { name, urls: url ? [url] : [] } });
+      const r = await api<{ key: string }>("/api/chatbots", { body: { name, urls: [] } });
       onDone(r.key);
     } catch (e) {
       setErr((e as Error).message);
@@ -153,24 +155,10 @@ function NewBot({ onClose, onDone }: { onClose: () => void; onDone: (key: string
   };
   return (
     <Modal title="New chatbot" onClose={onClose} footer={<><Button onClick={onClose}>Cancel</Button><Button variant="primary" busy={busy} disabled={!name.trim()} onClick={save}>Create chatbot</Button></>}>
-      <p className="mb-4 text-sm text-muted">Each chatbot has its own sources, categories, review queue and published knowledge base.</p>
+      <p className="mb-4 text-sm text-muted">Each chatbot has its own ServiceNow knowledge base, review queue and published versions.</p>
       <Label>Name</Label>
       <input autoFocus className={inputCls} placeholder="e.g. TTU Graduate School" value={name} onChange={(e) => setName(e.target.value)} />
-      <div className="h-3" />
-      <Label>Website to read (optional)</Label>
-      <input className={inputCls} placeholder="https://www.depts.ttu.edu/…" value={url} onChange={(e) => setUrl(e.target.value)} />
       {err && <p className="mt-3 text-sm text-red-600">{err}</p>}
-    </Modal>
-  );
-}
-
-function Rename({ who, onClose, onDone }: { who: string; onClose: () => void; onDone: (n: string) => void }) {
-  const [name, setName] = useState(who === "Reviewer" ? "" : who);
-  const save = () => { const n = name.trim() || "Reviewer"; localStorage.setItem("kb-reviewer", n); onDone(n); };
-  return (
-    <Modal title="Your name" onClose={onClose} footer={<><Button onClick={onClose}>Cancel</Button><Button variant="primary" onClick={save}>Save</Button></>}>
-      <p className="mb-4 text-sm text-muted">Shown next to your approvals, edits and comments so the team can see who did what.</p>
-      <input autoFocus className={inputCls} placeholder="Your name" value={name} onChange={(e) => setName(e.target.value)} onKeyDown={(e) => e.key === "Enter" && save()} />
     </Modal>
   );
 }

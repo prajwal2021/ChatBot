@@ -236,6 +236,23 @@ class ScopeChunk(Base):
     emb: Mapped[list] = mapped_column(JSONB)
 
 
+class User(Base):
+    """A reviewer who signs in. Created with `python -m app.users add "Name"`; the name is what History shows."""
+    __tablename__ = "users"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(80), unique=True)
+    password_hash: Mapped[str] = mapped_column(String(200))
+    created_at: Mapped[datetime] = mapped_column(TS, default=now)
+
+
+class LoginSession(Base):
+    """One signed-in browser. Only a hash of the cookie's token is stored, so a leaked table can't be used to sign in."""
+    __tablename__ = "login_sessions"
+    token_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    expires_at: Mapped[datetime] = mapped_column(TS)
+
+
 # ── ServiceNow curation ───────────────────────────────────────────────────────
 # A one-time import of ServiceNow knowledge articles, kept up to date from web pages ("links") that a person
 # attaches to a category. Separate from the website crawl above: its own review queue and published versions.
