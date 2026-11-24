@@ -12,7 +12,7 @@ import traceback
 from datetime import date, datetime, timedelta
 
 import httpx
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
 from . import publish, sn_ai
@@ -29,7 +29,9 @@ LIVE = ("approved", "changed", "removal")
 STATE_LABEL = {"draft": "Draft in ServiceNow", "review": "In review in ServiceNow",
                "pending_retirement": "Pending retirement in ServiceNow"}
 EXPIRED = "Expired in ServiceNow"
-SYSTEM_LABELS = {EXPIRED, "AI update", "New from link", "AI suggests removing", *STATE_LABEL.values()}
+NEWER = "Newer version in ServiceNow"
+STATE_WORD = {"draft": "draft", "review": "in-review", "pending_retirement": "pending-retirement", "published": "published"}
+SYSTEM_LABELS = {EXPIRED, NEWER, "AI update", "New from link", "AI suggests removing", *STATE_LABEL.values()}
 
 
 class SnError(Exception):
@@ -77,6 +79,77 @@ def _expired(valid_to: str | None) -> bool:
     return False
 
 
+def _version_rank(state: str | None, updated: str | None) -> tuple:
+    """Which ServiceNow record of an article to keep: the published one, then the most recently updated."""
+    return (state == "published", updated or "")
+
+
+def _one_per_number(articles: list[dict]) -> tuple[list[dict], dict[str, dict]]:
+    """ServiceNow keeps one record per article version (published v1, v2 in review...). Keep one record per KB
+    number and return, per number, the newer unpublished version whose text differs (if any)."""
+    groups: dict[str, list[dict]] = {}
+    out: list[dict] = []
+    for art in articles:
+        if art.get("number"):
+            groups.setdefault(art["number"], []).append(art)
+        else:
+            out.append(art)
+    newer: dict[str, dict] = {}
+    for number, rows in groups.items():
+        rows.sort(key=lambda r: _version_rank(r.get("state"), r.get("updated")), reverse=True)
+        base = rows[0]
+        out.append(base)
+        text = article_content(base, SN_INSTANCE + "/")
+        later = [r for r in rows[1:] if (r.get("updated") or "") > (base.get("updated") or "")
+                 and norm(article_content(r, SN_INSTANCE + "/")) != norm(text)]
+        if later:
+            newer[number] = max(later, key=lambda r: r.get("updated") or "")
+    return out, newer
+
+
+def merge_versions(db: Session, bot: Chatbot, actor: str = "system") -> dict:
+    """Collapse articles that came in more than once (one row per ServiceNow version) into one per KB number.
+    The published version stays. If a newer version says something different, its text becomes a proposal on the
+    kept article, so a reviewer decides whether it goes live. The extra rows are deleted."""
+    stats = {"numbers": 0, "removed": 0, "proposals": 0}
+    rows = db.scalars(select(SnArticle).where(SnArticle.chatbot_id == bot.id, SnArticle.number.is_not(None))).all()
+    groups: dict[str, list[SnArticle]] = {}
+    for a in rows:
+        groups.setdefault(a.number, []).append(a)
+    text = lambda a: (a.content if a.content is not None else a.p_content) or ""   # noqa: E731
+    for number, items in groups.items():
+        if len(items) < 2:
+            continue
+        items.sort(key=lambda a: (_version_rank(a.sn_state, a.sn_updated), a.status == "approved"), reverse=True)
+        base, others = items[0], items[1:]
+        diff = [o for o in others if norm(text(o)) != norm(text(base)) and (o.sn_updated or "") >= (base.sn_updated or "")]
+        newer = max(diff, key=lambda o: o.sn_updated or "", default=None)
+        if newer is not None:
+            reason = (f"ServiceNow also has a newer {STATE_WORD.get(newer.sn_state, newer.sn_state)} version of {number} with "
+                      "different text. Approve to use the newer text, or reject to keep the published text.")
+            if base.status == "approved":
+                base.status, base.detected_at = "changed", now()
+                base.p_title, base.p_content = (newer.title or newer.p_title or base.title), text(newer)
+                base.p_category_id, base.p_kind, base.p_reason = base.category_id, "update", reason
+                base.p_labels = sorted(set(base.labels or []) | {NEWER})
+                stats["proposals"] += 1
+            elif has_proposal(base):
+                base.p_labels = sorted(set(base.p_labels or []) | {NEWER})
+                base.p_reason = base.p_reason or reason
+        for o in others:
+            db.execute(update(SnLink).where(SnLink.article_id == o.id).values(article_id=base.id))
+            db.delete(o)
+        log(db, base, "merged_versions", actor, number=number, removed=[o.id for o in others],
+            newer_text=newer is not None)
+        stats["numbers"] += 1
+        stats["removed"] += len(others)
+    if stats["numbers"]:
+        record(db, bot.id, "merge_versions", actor, f"Merged {stats['numbers']} articles that were imported once per ServiceNow "
+               f"version: {stats['removed']} extra copies removed, {stats['proposals']} newer texts waiting in Review", **stats)
+    db.commit()
+    return stats
+
+
 def import_kb(db: Session, bot: Chatbot, kb: dict, actor: str) -> dict:
     """kb = {categories: [{sys_id, label, parent, active}], articles: [{sys_id, number, title, state, category, template,
     valid_to, updated, parts, text}]}. Safe to run again: existing categories are updated, articles that nobody has
@@ -112,14 +185,21 @@ def import_kb(db: Session, bot: Chatbot, kb: dict, actor: str) -> dict:
         r.position = i
 
     existing = {a.sys_id: a for a in db.scalars(select(SnArticle).where(SnArticle.chatbot_id == bot.id, SnArticle.sys_id.is_not(None)))}
-    for art in kb.get("articles") or []:
+    have_numbers = {a.number: a.sys_id for a in existing.values() if a.number}
+    incoming, newer_of = _one_per_number(kb.get("articles") or [])
+    stats["versions_skipped"] = len(kb.get("articles") or []) - len(incoming)
+    for art in incoming:
+        if art.get("number") in have_numbers and have_numbers[art["number"]] != art["sys_id"]:
+            stats["versions_skipped"] += 1                    # another version of this article is already here
+            continue
         content = article_content(art, SN_INSTANCE + "/")
         title = norm(art.get("title") or "") or art.get("number") or "Untitled article"
         cat = cats.get(art.get("category") or "")
         raw = " ".join(p[1] for p in art.get("parts") or [] if p[1]) + (art.get("text") or "")
         internal = "INTERNAL" in (art.get("title") or "") or "INTERNAL USE ONLY" in raw.upper()
+        newer = newer_of.get(art.get("number") or "")
         labels = [x for x in [STATE_LABEL.get(art.get("state") or ""), EXPIRED if _expired(art.get("valid_to")) else None,
-                              "Internal only" if internal else None] if x]
+                              "Internal only" if internal else None, NEWER if newer else None] if x]
         a = existing.get(art["sys_id"])
         if a is not None and (a.reviewer or a.status != "new" or a.p_kind != "import" or a.p_edited):
             stats["articles_kept"] += 1                       # a person or the AI already worked on it: leave it alone
@@ -136,7 +216,8 @@ def import_kb(db: Session, bot: Chatbot, kb: dict, actor: str) -> dict:
         a.sn_content = content
         a.category_id = cat.id if cat else None
         a.p_title, a.p_content, a.p_category_id, a.p_labels, a.p_kind = title, content or "(This article has no text in ServiceNow.)", a.category_id, labels, "import"
-        a.p_reason = None
+        a.p_reason = (f"ServiceNow also has a newer {STATE_WORD.get(newer.get('state'), newer.get('state'))} version of {a.number}. "
+                      "This is the published text; check the newer one in ServiceNow before approving.") if newer else None
         db.flush()
         log(db, a, "imported", actor, number=a.number, state=a.sn_state)
     record(db, bot.id, "import", actor, f"Imported from ServiceNow: {stats['articles_new']} new articles, "
@@ -187,7 +268,7 @@ def approve(db: Session, a: SnArticle, actor: str) -> None:
     kind = "change_approved" if a.content is not None else "approved"
     a.title, a.content = a.p_title, a.p_content
     a.category_id = a.p_category_id if a.p_category_id is not None else a.category_id
-    a.labels = [x for x in a.p_labels or [] if x not in ("AI update", "New from link", "AI suggests removing")]
+    a.labels = [x for x in a.p_labels or [] if x not in ("AI update", "New from link", "AI suggests removing", NEWER)]
     a.revision += 1
     a.status, a.reviewer, a.reviewed_at = "approved", actor, now()
     clear_proposal(a)
@@ -527,3 +608,12 @@ def publish_version(db: Session, bot: Chatbot, note: str, actor: str) -> SnVersi
            f"{st.get('removed', 0)} removed ({st.get('total', 0)} articles)", version=v.number)
     db.commit()
     return v
+
+
+if __name__ == "__main__":                                     # python -m app.servicenow merge-versions
+    import sys as _sys
+    if _sys.argv[1:] != ["merge-versions"]:
+        _sys.exit("usage: python -m app.servicenow merge-versions")
+    with SessionLocal() as _db:
+        for _bot in _db.scalars(select(Chatbot).order_by(Chatbot.id)).all():
+            print(_bot.key, merge_versions(_db, _bot, "Duplicate clean-up"))

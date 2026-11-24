@@ -171,3 +171,45 @@ def test_ai_edits_apply_exactly_or_fail():
         apply_edits(body, [{"find": "not in the article", "replace": "x"}])
     with pytest.raises(AIError):
         apply_edits("a\na", [{"find": "a", "replace": "b"}])
+
+
+@pytestmark_db
+def test_versions_collapse_to_one_article_per_number(env):
+    s, bot, sn = env
+    from app.models import SnArticle
+
+    cat = {"sys_id": "c" * 32, "label": "Fees", "parent": None, "active": True}
+    def art(sys, state, updated, text):
+        return {"sys_id": sys, "number": "KB9", "title": "Fees", "state": state, "category": "c" * 32, "template": "kb_template_what_is",
+                "valid_to": "2100-01-01", "updated": updated, "parts": [["kb_explanation", f"<p>{text}</p>"]], "text": ""}
+
+    # one import batch holding the published version and a newer one in review: one article, published text, flagged
+    st = sn.import_kb(s, bot, {"categories": [cat], "articles": [art("1" * 32, "review", "2025-02-01", "Fee is $50."),
+                                                                art("2" * 32, "published", "2025-01-01", "Fee is $40.")]}, "t")
+    rows = s.query(SnArticle).filter_by(number="KB9").all()
+    assert len(rows) == 1 and st["versions_skipped"] == 1
+    assert rows[0].sys_id == "2" * 32 and rows[0].p_content == "Fee is $40." and sn.NEWER in rows[0].p_labels
+
+    # re-import never brings the other version back
+    sn.import_kb(s, bot, {"categories": [cat], "articles": [art("1" * 32, "review", "2025-02-01", "Fee is $50.")]}, "t")
+    assert s.query(SnArticle).filter_by(number="KB9").count() == 1
+
+    # data imported before this fix: two approved rows; merging keeps the published one and proposes the newer text
+    a1 = rows[0]
+    sn.approve(s, a1, "t")
+    dup = SnArticle(chatbot_id=bot.id, sys_id="3" * 32, number="KB9", sn_state="review", sn_updated="2025-03-01",
+                    status="approved", title="Fees", content="Fee is $55.", category_id=a1.category_id)
+    same = SnArticle(chatbot_id=bot.id, sys_id="4" * 32, number="KB8", sn_state="published", sn_updated="2025-01-01",
+                     status="approved", title="X", content="Same.")
+    same2 = SnArticle(chatbot_id=bot.id, sys_id="5" * 32, number="KB8", sn_state="draft", sn_updated="2025-02-01",
+                      status="approved", title="X", content="Same.")
+    s.add_all([dup, same, same2])
+    s.commit()
+    r = sn.merge_versions(s, bot, "t")
+    assert r == {"numbers": 2, "removed": 2, "proposals": 1}
+    kept = s.query(SnArticle).filter_by(number="KB9").one()
+    assert kept.id == a1.id and kept.status == "changed" and kept.content == "Fee is $40." and kept.p_content == "Fee is $55."
+    assert s.query(SnArticle).filter_by(number="KB8").one().sys_id == "4" * 32
+    sn.approve(s, kept, "t")
+    assert kept.content == "Fee is $55." and sn.NEWER not in kept.labels
+    assert sn.merge_versions(s, bot, "t") == {"numbers": 0, "removed": 0, "proposals": 0}
