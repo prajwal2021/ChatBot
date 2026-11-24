@@ -565,23 +565,65 @@ def add_link(db: Session, bot: Chatbot, category_id: int, url: str, actor: str, 
 
 # ── publishing ────────────────────────────────────────────────────────────────
 
-def live_items(db: Session, bot: Chatbot) -> list[dict]:
-    cats = {c.id: c for c in db.scalars(select(SnCategory).where(SnCategory.chatbot_id == bot.id))}
-    links = {l.id: l.url for l in db.scalars(select(SnLink).where(SnLink.chatbot_id == bot.id))}
-    items = []
-    for a in db.scalars(select(SnArticle).where(SnArticle.chatbot_id == bot.id, SnArticle.status.in_(LIVE), SnArticle.content.is_not(None))):
-        c = cats.get(a.category_id)
-        items.append({
-            "entry_id": a.id, "title": a.title, "content": a.content, "category_id": a.category_id,
-            "category": c.path if c else "Uncategorized", "category_position": c.position if c else 99999, "color": "slate",
-            "secondary": [], "labels": [x for x in a.labels or [] if x not in SYSTEM_LABELS],
-            "number": a.number, "source_url": kb_url(a.number), "source_title": a.number,
-            "manual_edit": False, "revision": a.revision, "_order": (a.number or "~", a.id),
-        })
+PUBLISHED_LABEL = "Published in ServiceNow"
+REVIEWED, NOT_REVIEWED = "Reviewed in KB Curation", "Not reviewed in KB Curation"
+INTERNAL = "Internal only"
+SN_STATE_LABEL = {"published": PUBLISHED_LABEL, **STATE_LABEL}
+
+
+def status_of(a: SnArticle, reviewed: bool) -> tuple[list[str], dict]:
+    """Labels and fields that say where an article stands, worked out from its current state at publish time, so
+    every item gets them the same way: exactly one ServiceNow state, expired/internal when true, and whether a
+    person approved it here. The chatbot can filter on either (e.g. only "Published in ServiceNow" + "Reviewed")."""
+    state = a.sn_state if a.sys_id else None
+    title, text = (a.title or a.p_title or ""), (a.content or a.p_content or "")
+    internal = INTERNAL in (a.labels or []) or INTERNAL in (a.p_labels or []) or "INTERNAL" in title or "INTERNAL USE ONLY" in text.upper()
+    expired = bool(a.sys_id) and _expired(a.valid_to)
+    labels = [SN_STATE_LABEL.get(state or "", f"{state} in ServiceNow") if a.sys_id else "Not in ServiceNow (added from a TTU page)"]
+    labels += [EXPIRED] if expired else []
+    labels += [INTERNAL] if internal else []
+    labels += [REVIEWED if reviewed else NOT_REVIEWED]
+    meta = {"servicenow_state": state, "servicenow_expired": expired, "internal_only": internal,
+            "reviewed_in_kb_curation": reviewed, "reviewed_by": a.reviewer if reviewed else None,
+            "reviewed_at": a.reviewed_at.isoformat() if reviewed and a.reviewed_at else None}
+    return labels, meta
+
+
+def _item(a: SnArticle, cats: dict, reviewed: bool) -> dict:
+    c = cats.get(a.category_id if reviewed else (a.p_category_id or a.category_id))
+    status_labels, meta = status_of(a, reviewed)
+    own = [x for x in (a.labels if reviewed else a.p_labels) or [] if x not in SYSTEM_LABELS and x != INTERNAL]
+    return {
+        "entry_id": a.id, "title": a.title if reviewed else a.p_title, "content": a.content if reviewed else a.p_content,
+        "category_id": c.id if c else None, "category": c.path if c else "Uncategorized", "category_position": c.position if c else 99999,
+        "color": "slate", "secondary": [], "labels": own + status_labels, "meta": meta,
+        "number": a.number, "source_url": kb_url(a.number), "source_title": a.number,
+        "manual_edit": False, "revision": a.revision, "_order": (a.number or "~", a.id),
+    }
+
+
+def _sorted(items: list[dict]) -> list[dict]:
     items.sort(key=lambda x: (x["category_position"], x["_order"]))
     for it in items:
         it.pop("_order")
     return items
+
+
+def live_items(db: Session, bot: Chatbot) -> list[dict]:
+    """What a published version holds: every article a person approved here (its approved text)."""
+    cats = {c.id: c for c in db.scalars(select(SnCategory).where(SnCategory.chatbot_id == bot.id))}
+    return _sorted([_item(a, cats, True) for a in db.scalars(select(SnArticle).where(
+        SnArticle.chatbot_id == bot.id, SnArticle.status.in_(LIVE), SnArticle.content.is_not(None)))])
+
+
+def everything_items(db: Session, bot: Chatbot) -> list[dict]:
+    """Approved articles plus the ones still waiting for their first review (as imported), each labelled with
+    whether it was reviewed here. Rejected and removed articles are left out."""
+    cats = {c.id: c for c in db.scalars(select(SnCategory).where(SnCategory.chatbot_id == bot.id))}
+    rows = db.scalars(select(SnArticle).where(SnArticle.chatbot_id == bot.id, SnArticle.status.not_in(("rejected", "removed")))).all()
+    out = [_item(a, cats, True) if a.content is not None else _item(a, cats, False) for a in rows
+           if a.content is not None or a.p_content is not None]
+    return _sorted(out)
 
 
 def latest(db: Session, bot: Chatbot) -> SnVersion | None:

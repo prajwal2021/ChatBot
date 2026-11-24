@@ -53,6 +53,8 @@ function Inner() {
           <>
             <a href={exp("json")} className="inline-flex h-9 items-center gap-1.5 rounded-[10px] border border-line bg-white px-3.5 text-sm font-medium hover:bg-subtle"><Download className="size-4" /> JSON for the chatbot</a>
             <a href={exp("md")} className="inline-flex h-9 items-center gap-1.5 rounded-[10px] border border-line bg-white px-3.5 text-sm font-medium hover:bg-subtle"><Download className="size-4" /> Markdown</a>
+            <a href={`${API}/api/chatbots/${bot}/servicenow/export?format=json&scope=everything`} title="Approved articles plus those not reviewed yet, each labelled with its ServiceNow state and review status"
+              className="inline-flex h-9 items-center gap-1.5 rounded-[10px] border border-line bg-white px-3.5 text-sm font-medium hover:bg-subtle"><Download className="size-4" /> Everything (JSON)</a>
             <select className="h-9 rounded-[10px] border border-line bg-white px-3 text-sm font-medium" value={v.number} onChange={(e) => router.replace(`/${bot}/servicenow/kb?version=${e.target.value}`)}>
               {versions.data?.map((x) => <option key={x.id} value={x.number}>Version {x.number}{x.number === latest ? " (live)" : ""}</option>)}
             </select>
@@ -86,6 +88,7 @@ function Inner() {
                   <p className="text-xs text-muted">{i.category}</p>
                   <h3 className="mt-0.5 font-semibold">{i.title}</h3>
                   {i.number && i.source_url && <a href={i.source_url} target="_blank" rel="noreferrer" className="mt-0.5 inline-flex items-center gap-1 font-mono text-xs text-muted hover:text-ink">{i.number} <ExternalLink className="size-3" /></a>}
+                  {i.labels.length > 0 && <div className="mt-2 flex flex-wrap gap-1.5">{i.labels.map((l) => <Badge key={l} tone={labelTone(l)}>{l}</Badge>)}</div>}
                   <Rich className="mt-3" content={i.content} />
                 </Card>
               ))}
@@ -97,4 +100,13 @@ function Inner() {
       )}
     </Page>
   );
+}
+
+/** Status labels in colour, so filters like "published and reviewed" are easy to spot. */
+function labelTone(l: string): "green" | "amber" | "red" | "blue" | "outline" {
+  if (l === "Published in ServiceNow" || l === "Reviewed in KB Curation") return "green";
+  if (l === "Expired in ServiceNow" || l === "Internal only" || l.startsWith("Pending retirement")) return "red";
+  if (l.endsWith("in ServiceNow") || l === "Not reviewed in KB Curation") return "amber";
+  if (l.startsWith("Not in ServiceNow")) return "blue";
+  return "outline";
 }
