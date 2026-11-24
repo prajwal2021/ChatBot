@@ -15,7 +15,7 @@ from . import docgen, servicenow as sn, sn_ai
 from .config import DATA_DIR, PUBLIC_API_BASE, SN_IMPORT_TOKEN, SN_MODEL
 from .db import get_db
 from .diffing import line_diff
-from .models import Activity, Chatbot, SnArticle, SnArticleEvent, SnAsset, SnCategory, SnLink, SnLinkEvent, SnVersion
+from .models import Activity, Chatbot, SnArticle, SnArticleEvent, SnAsset, SnCategory, SnLink, SnLinkEvent, SnVersion, now
 from .users import actor, current_user
 
 router = APIRouter(dependencies=[Depends(current_user)])   # every ServiceNow screen needs a signed-in reviewer
@@ -408,18 +408,31 @@ def _for_export(items: list[dict], base: str) -> list[dict]:
 
 
 @router.get("/api/chatbots/{key}/servicenow/export")
-def export(request: Request, format: str = "json", version: int | None = None, bot: Chatbot = Depends(get_bot), db: Session = Depends(get_db)):
-    v = _version(db, bot, version)
+def export(request: Request, format: str = "json", version: int | None = None, scope: str = "published",
+           bot: Chatbot = Depends(get_bot), db: Session = Depends(get_db)):
+    """scope=published: a published version. scope=everything: right now, approved articles plus those not reviewed
+    yet, each labelled with its ServiceNow state and whether it was reviewed here, for a chatbot that filters."""
     base = PUBLIC_API_BASE.rstrip("/") or str(request.base_url).rstrip("/")
-    items = _for_export(v.items, base)
-    name = f"{bot.key}-servicenow-kb-v{v.number}"
+    if scope == "everything":
+        when = now()
+        raw, number, label = sn.everything_items(db, bot), 0, "everything"
+        name = f"{bot.key}-servicenow-kb-everything-{when:%Y%m%d}"
+    elif scope == "published":
+        v = _version(db, bot, version)
+        raw, number, when, label = v.items, v.number, v.created_at, f"v{v.number}"
+        name = f"{bot.key}-servicenow-kb-v{v.number}"
+    else:
+        raise HTTPException(400, "scope must be published or everything")
+    items = _for_export(raw, base)
     if format == "md":
-        return Response(docgen.build_markdown(f"{bot.name} ServiceNow", v.number, v.created_at.strftime("%B %d, %Y"), items),
+        return Response(docgen.build_markdown(f"{bot.name} ServiceNow ({label})", number, when.strftime("%B %d, %Y"), items),
                         media_type="text/markdown; charset=utf-8", headers={"Content-Disposition": f'attachment; filename="{name}.md"'})
     if format == "json":
-        doc = docgen.build_json(f"{bot.key}-servicenow", f"{bot.name} ServiceNow", v.number, v.created_at.isoformat(), items)
+        doc = docgen.build_json(f"{bot.key}-servicenow", f"{bot.name} ServiceNow", number, when.isoformat(), items)
+        doc["scope"] = scope
         for e, it in zip(doc["entries"], items):
             e["servicenow_number"] = it.get("number")
+            e.update(it.get("meta") or {})                 # older versions were published without these fields
         return Response(json.dumps(doc, ensure_ascii=False, indent=2), media_type="application/json",
                         headers={"Content-Disposition": f'attachment; filename="{name}.json"'})
     raise HTTPException(400, "format must be json or md")

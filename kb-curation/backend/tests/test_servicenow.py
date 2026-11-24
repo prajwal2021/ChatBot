@@ -216,19 +216,41 @@ def test_versions_collapse_to_one_article_per_number(env):
 
 
 @pytestmark_db
-def test_servicenow_workflow_labels_never_reach_published_knowledge(env):
+def test_every_published_item_gets_consistent_status_labels(env):
     s, bot, sn = env
     from app.models import SnArticle
 
-    st = sn.import_kb(s, bot, KB, "t")
+    sn.import_kb(s, bot, KB, "t")
     a = s.query(SnArticle).filter_by(number="KB2").one()        # a draft in ServiceNow, flagged "Internal only"
     assert "Draft in ServiceNow" in a.p_labels                   # the reviewer sees where it stood in ServiceNow
-    sn.approve(s, a, "t")
-    assert "Draft in ServiceNow" not in a.labels and "Internal only" in a.labels
+    sn.approve(s, a, "Jane")
+    assert "Draft in ServiceNow" not in a.labels                 # not stored: worked out again at publish time
 
-    old = s.query(SnArticle).filter_by(number="KB1").one()        # approved before this fix, flags still on it
-    sn.approve(s, old, "t")
-    old.labels = ["Expired in ServiceNow", "In review in ServiceNow", "Fees"]
+    old = s.query(SnArticle).filter_by(number="KB1").one()        # published in ServiceNow, expired, approved long ago
+    sn.approve(s, old, "Jane")
+    old.labels = ["In review in ServiceNow", "Fees"]             # a stale flag left over from before
     s.commit()
-    assert all("ServiceNow" not in l for it in sn.live_items(s, bot) for l in it["labels"])
+    items = {i["number"]: i for i in sn.live_items(s, bot)}
+    assert items["KB1"]["labels"] == ["Fees", "Published in ServiceNow", "Expired in ServiceNow", "Reviewed in KB Curation"]
+    assert items["KB2"]["labels"] == ["Draft in ServiceNow", "Internal only", "Reviewed in KB Curation"]
+    assert items["KB2"]["meta"]["servicenow_state"] == "draft" and items["KB2"]["meta"]["reviewed_by"] == "Jane"
     assert sn.clear_review_flags(s, bot, "t") == 1 and old.labels == ["Fees"]
+
+
+@pytestmark_db
+def test_everything_export_includes_unreviewed_articles_labelled(env):
+    s, bot, sn = env
+    from app.models import SnArticle
+
+    sn.import_kb(s, bot, KB, "t")
+    sn.approve(s, s.query(SnArticle).filter_by(number="KB1").one(), "Jane")
+    rej = s.query(SnArticle).filter_by(number="KB2").one()
+    s.commit()
+    every = {i["number"]: i for i in sn.everything_items(s, bot)}
+    assert every["KB1"]["meta"]["reviewed_in_kb_curation"] and "Reviewed in KB Curation" in every["KB1"]["labels"]
+    assert not every["KB2"]["meta"]["reviewed_in_kb_curation"] and "Not reviewed in KB Curation" in every["KB2"]["labels"]
+    assert every["KB2"]["content"] == "Escalate."
+    sn.reject(s, rej, "Jane")
+    s.commit()
+    assert "KB2" not in {i["number"] for i in sn.everything_items(s, bot)}
+    assert [i["number"] for i in sn.live_items(s, bot)] == ["KB1"]
