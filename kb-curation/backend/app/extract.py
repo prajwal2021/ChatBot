@@ -183,13 +183,26 @@ def page_text(sections: list[dict]) -> str:
     return "\n\n".join(f"## {s['title']}\n{s['content']}" for s in sections)
 
 
-def extract(html: str, url: str) -> dict:
+MAIN_ID = re.compile(r"^(main[-_]?content|content)$", re.I)
+MIN_MAIN = 200      # characters of text a main area needs; less means we matched a skip link or an empty shell
+
+
+def _main_area(soup: BeautifulSoup):
+    """The page's main content: <main>, or an element whose id is exactly main-content / content.
+    A match with almost no text (a "skip to main content" link, an empty app shell) does not count."""
+    for cand in (soup.find("main"), soup.find(id=MAIN_ID)):
+        if cand is not None and cand.name != "a" and len(cand.get_text(" ", strip=True)) >= MIN_MAIN:
+            return cand
+    return soup.body or soup
+
+
+def extract(html: str, url: str, _noscript: bool = True) -> dict:
     """The site-wide contact block (.l-contact) repeats on most pages, so it is returned apart as "contact"
     (not in sections/text); crawler.attach_contacts() gives each distinct block to one page only."""
     soup = BeautifulSoup(html, "lxml")
     links = page_links(soup, url)
     raw_title = norm(soup.title.get_text()) if soup.title else ""
-    main = soup.find("main") or soup.find(id=re.compile(r"main.?content|^content$", re.I)) or soup.body or soup
+    main = _main_area(soup)
     for t in main.find_all(DROP_TAGS):
         t.decompose()
     for t in main.find_all(class_=DROP_CLASS):
@@ -210,5 +223,12 @@ def extract(html: str, url: str) -> dict:
     b = _Builder(url, title)
     b.walk(main)
     sections = _clean(_fold(b.sections))
+    if not sections and _noscript:
+        # Some sites are JavaScript apps that put the readable page in a <noscript> fallback (e.g. Instructure's
+        # Canvas guides). Only when nothing else was found, read the largest such block instead.
+        blocks = BeautifulSoup(html, "lxml").find_all("noscript")
+        big = max(blocks, key=lambda n: len(n.get_text(" ", strip=True)), default=None)
+        if big is not None and len(big.get_text(" ", strip=True)) >= MIN_MAIN:
+            return {**extract(big.decode_contents(), url, _noscript=False), "links": links}
     text = page_text(sections)
     return {"title": title, "sections": sections, "links": links, "text": text, "hash": sha(text), "contact": contact}
